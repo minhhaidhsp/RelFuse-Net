@@ -1,6 +1,6 @@
 # RelFuse-Net: Inductive GraphSAGE with LLM for Multimodal EHR Diagnosis
 
-This repository contains the official PyTorch implementation of **RelFuse-Net**, as presented in the paper: *"RelFuse-Net: Inductive Patient Relation Graph Learning with Large Language Models for Multimodal Electronic Health Records Disease Prediction"*.
+This repository contains the official PyTorch implementation of **RelFuse-Net**, as presented in the paper: *"RelFuse-Net: Multimodal Fusion of Electronic Health Records for Disease Prediction via Inductive Graph Learning and Large Language Models"*.
 
 ## ⚠️ Data Access & Privacy
 This code is designed to run on the **MIMIC-CXR** and **MIMIC-III** datasets. 
@@ -23,4 +23,5 @@ Researchers wishing to reproduce our results must:
 
 ### 1. Install Dependencies
 ```bash
+
 pip install -r requirements.txt
