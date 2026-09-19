@@ -13,7 +13,12 @@ RelFuse-Net training pipeline (Algorithm 2), corrected to:
   - repeat the whole pipeline over Config.NUM_RUNS seeds for mean +/- std (Table 7/8),
   - support Scenario A (prospective, report-free) vs Scenario B (retrospective, full
     model) as two separately trained/evaluated models (Table 2 / Ablation Study),
-    via Config.SCENARIO for a single run or `--ablation` for both.
+    via Config.SCENARIO for a single run or `--ablation` for both,
+  - RESUME automatically if interrupted (e.g. a Colab/remote session drops):
+    every epoch's full state (model, optimizer, scheduler, vCLUB nets + their
+    optimizers, RNG state, best-val-so-far) is checkpointed to a per-seed/
+    per-scenario "resume" file; re-running the same command picks up right
+    after the last completed epoch instead of restarting from epoch 0.
 
 Run `preprocessing/build_mimic_dataset.py` first to produce the three CSVs and
 the training graph this script expects.
@@ -234,6 +239,53 @@ def evaluate(model, train_ds, eval_ds, edge_index_train, n_train, scenario):
     return {"per_class": per_class, "macro": macro}
 
 
+def _resume_path(seed: int, scenario: str) -> str:
+    return f"relfusenet_resume_seed{seed}_scenario{scenario}.pt"
+
+
+def _save_resume_state(path, epoch, model, opt, scheduler, vclubs, vclub_opts, best_val_auc):
+    """Checkpoints EVERYTHING needed to continue training from right after `epoch`
+    finished -- not just model weights (that's the separate `ckpt_path` "best so
+    far" file used at test time). Written after every epoch so a dropped session
+    (Colab disconnect, remote SSH drop, etc.) loses at most one epoch of work."""
+    state = {
+        "epoch": epoch,
+        "model": model.state_dict(),
+        "opt": opt.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "vclubs": {k: v.state_dict() for k, v in vclubs.items()},
+        "vclub_opts": {k: v.state_dict() for k, v in vclub_opts.items()},
+        "best_val_auc": best_val_auc,
+        "rng_state": {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+            "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        },
+    }
+    tmp = path + ".part"
+    torch.save(state, tmp)
+    os.replace(tmp, path)  # atomic on both POSIX and Windows -- never leaves a half-written resume file
+
+
+def _load_resume_state(path, model, opt, scheduler, vclubs, vclub_opts):
+    ckpt = torch.load(path, map_location=Config.DEVICE)
+    model.load_state_dict(ckpt["model"])
+    opt.load_state_dict(ckpt["opt"])
+    scheduler.load_state_dict(ckpt["scheduler"])
+    for k, v in vclubs.items():
+        v.load_state_dict(ckpt["vclubs"][k])
+    for k, v in vclub_opts.items():
+        v.load_state_dict(ckpt["vclub_opts"][k])
+    rng = ckpt["rng_state"]
+    random.setstate(rng["python"])
+    np.random.set_state(rng["numpy"])
+    torch.set_rng_state(rng["torch"])
+    if rng["torch_cuda"] is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(rng["torch_cuda"])
+    return ckpt["epoch"], ckpt["best_val_auc"]
+
+
 def run_one_seed(seed: int, scenario: str = None):
     scenario = Config.SCENARIO if scenario is None else scenario
     set_seed(seed)
@@ -272,8 +324,17 @@ def run_one_seed(seed: int, scenario: str = None):
     scheduler = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=Config.EPOCHS, eta_min=Config.LR_MIN)
 
     ckpt_path = f"relfusenet_best_seed{seed}_scenario{scenario}.pth"
+    resume_path = _resume_path(seed, scenario)
+    start_epoch = 0
     best_val_auc = 0.0
-    for epoch in range(Config.EPOCHS):
+    if os.path.exists(resume_path):
+        print(f"[Resume] Found {resume_path} -- resuming interrupted run instead of restarting from epoch 0.")
+        last_epoch, best_val_auc = _load_resume_state(resume_path, model, opt, scheduler, vclubs, vclub_opts)
+        start_epoch = last_epoch + 1
+        print(f"[Resume] Continuing from epoch {start_epoch + 1}/{Config.EPOCHS} "
+              f"(best_val_auc so far = {best_val_auc:.4f}).")
+
+    for epoch in range(start_epoch, Config.EPOCHS):
         train_loss = run_epoch_train(model, train_ds, edge_index_train, bce, vclubs, vclub_opts, opt, n_train, scenario)
         scheduler.step()
 
@@ -284,6 +345,11 @@ def run_one_seed(seed: int, scenario: str = None):
         if val_auc > best_val_auc:
             best_val_auc = val_auc
             torch.save(model.state_dict(), ckpt_path)
+
+        _save_resume_state(resume_path, epoch, model, opt, scheduler, vclubs, vclub_opts, best_val_auc)
+
+    if os.path.exists(resume_path):
+        os.remove(resume_path)  # this seed/scenario finished cleanly; nothing left to resume
 
     model.load_state_dict(torch.load(ckpt_path))
     test_metrics = evaluate(model, train_ds, test_ds, edge_index_train, n_train, scenario)

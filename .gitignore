@@ -8,3 +8,5 @@ data/mimic_seed/
 data/mimic_subset/
 data/processed/
 data/images/
+relfusenet_resume_*.pt
+relfusenet_best_*.pth
