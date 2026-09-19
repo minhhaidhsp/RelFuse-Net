@@ -1,0 +1,13 @@
+torch>=2.0.0
+torchvision>=0.15.0
+torch-geometric>=2.4.0
+transformers>=4.30.0
+peft>=0.4.0
+accelerate>=0.21.0
+bitsandbytes>=0.41.0
+pandas>=1.5.0
+scikit-learn>=1.2.0
+pillow>=9.0.0
+tqdm
+# Optional but recommended for faster NeighborLoader sampling in train.py:
+# pyg-lib, torch-scatter, torch-sparse (install per https://pytorch-geometric.readthedocs.io)
