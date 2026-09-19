@@ -31,6 +31,11 @@ class TextEncoder(nn.Module):
     described in Section 3.2.1 and must be used for any result reported as the
     paper's findings; last-token pooling is not equivalent and should only be
     used, if ever, as an explicit ablation.
+
+    This encoder is only ever called under Scenario B (retrospective, report-
+    assisted). Under Scenario A (prospective, report-free) RelFuseNet.forward
+    never calls it at all -- see the scenario branch there -- so no report
+    content can leak into the model regardless of what this class does.
     """
 
     def __init__(self):
@@ -71,13 +76,22 @@ class TextEncoder(nn.Module):
 # --- 3. MLTM Encoder (Masked Lab-Test Modeling, Section 3.2.2) ---
 class MLTMEncoder(nn.Module):
     """
-    Self-supervised tabular encoder. `forward` returns BOTH the projected feature
-    used downstream by the graph/fusion stages, and the full reconstruction x_hat
-    used only by the Stage-1 pretraining loss (losses.mltm_reconstruction_loss).
+    Self-supervised tabular encoder. `forward` returns the projected feature used
+    downstream by the graph/fusion stages, the full reconstruction x_hat used only
+    by the Stage-1 pretraining loss (losses.mltm_reconstruction_loss), and the
+    artificial-masking indicator a_i actually used, for the caller to pass into
+    that loss.
 
-    `observed_mask` (m_i, 1 = genuinely recorded) must come from the real data;
-    `artificial_mask` (drawn only from positions where observed_mask == 1) is
-    generated here during training to implement Eq. 3's self-supervised task.
+    Three distinct binary indicators (do not conflate them -- this is exactly
+    the distinction Referee 2, point #8 asked for):
+      o (o_i): observation indicator, 1 = genuinely recorded in the raw EHR.
+               Comes from the real data via `observed_mask`; never generated here.
+      a (a_i): artificial-masking indicator, 1 = held out at this training step
+               and used as a reconstruction target. Generated HERE, sampled only
+               from positions where o_i == 1 (so a_i <= o_i elementwise always).
+               a_i == 0 everywhere at inference (nothing is held out).
+      v (v_i): visibility mask, v_i = o_i * (1 - a_i). This is what the encoder
+               is actually allowed to see as input (Eq. 3): x_tilde_i = x_i * v_i.
     """
 
     def __init__(self):
@@ -93,21 +107,19 @@ class MLTMEncoder(nn.Module):
         self.proj = nn.Linear(Config.MLTM_HIDDEN, Config.PROJ_DIM)
 
     def forward(self, x: torch.Tensor, observed_mask: torch.Tensor, training: bool = True):
+        o = observed_mask
         if training:
-            keep_prob = 1 - Config.MASK_RATIO
-            # Only mask positions that are actually observed; naturally-missing
-            # entries are already zero-filled upstream and stay excluded.
-            artificial_mask = torch.bernoulli(
-                torch.full_like(x, keep_prob)
-            ) * observed_mask
+            # a_i ~ Bernoulli(rho), restricted to genuinely-observed positions.
+            a = torch.bernoulli(torch.full_like(x, Config.MASK_RATIO)) * o
         else:
-            artificial_mask = observed_mask  # no extra hiding at eval time
+            a = torch.zeros_like(x)  # inference: nothing held out
 
-        x_in = x * artificial_mask
+        v = o * (1 - a)          # visibility mask (Eq. 3)
+        x_in = x * v             # x_tilde_i
         h = self.encoder(x_in)
         x_hat = self.decoder(h)
         h_proj = self.proj(h)
-        return h_proj, x_hat, artificial_mask
+        return h_proj, x_hat, a
 
 
 # --- 4. RelFuse-Net Integrator ---
@@ -141,13 +153,24 @@ class RelFuseNet(nn.Module):
             nn.Linear(256, Config.NUM_CLASSES),
         )
 
-    def forward(self, img, txt_ids, txt_mask, tab, tab_observed_mask, edge_index, training=None):
+    def forward(self, img, txt_ids, txt_mask, tab, tab_observed_mask, edge_index,
+                training=None, scenario=None):
         is_training = self.training if training is None else training
+        # Table 2 / Ablation Study: "A" = prospective, report-free; "B" = full model.
+        scenario = Config.SCENARIO if scenario is None else scenario
+        if scenario not in ("A", "B"):
+            raise ValueError(f"scenario must be 'A' or 'B', got {scenario!r}")
 
         # 1. Unimodal encoding
         h_v = self.vision_enc(img)
-        h_t = self.text_enc(txt_ids, txt_mask)
-        h_tab, x_hat, artificial_mask = self.mltm_enc(tab, tab_observed_mask, training=is_training)
+        if scenario == "A":
+            # Prospective / report-free: the text encoder is never called, so no
+            # report content -- real or otherwise -- can reach the model. This is
+            # what makes Scenario A the leakage-safe predictor in the t0 table.
+            h_t = torch.zeros(h_v.shape[0], Config.PROJ_DIM, device=h_v.device, dtype=h_v.dtype)
+        else:
+            h_t = self.text_enc(txt_ids, txt_mask)
+        h_tab, x_hat, a_tab = self.mltm_enc(tab, tab_observed_mask, training=is_training)
 
         # 2. Initial node feature z_i = Concat(image, text, tabular) -- Eq. "z_i" (Algorithm 1)
         node_feats = torch.cat([h_v, h_t, h_tab], dim=1)
@@ -176,5 +199,6 @@ class RelFuseNet(nn.Module):
             "tab_x": tab,
             "tab_x_hat": x_hat,
             "tab_observed_mask": tab_observed_mask,
-            "tab_artificial_mask": artificial_mask,
+            "tab_artificial_mask": a_tab,  # a_i, for losses.mltm_reconstruction_loss
+            "scenario": scenario,
         }

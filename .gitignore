@@ -1,2 +1,10 @@
 physionet_password.txt
 *.csv.gz.part
+
+.venv/
+__pycache__/
+*.pth
+data/mimic_seed/
+data/mimic_subset/
+data/processed/
+data/images/

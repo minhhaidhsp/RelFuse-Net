@@ -5,16 +5,20 @@ RelFuse-Net training pipeline (Algorithm 2), corrected to:
     so no gradient or message ever flows from held-out admissions into training,
   - train with GraphSAGE minibatch neighbor sampling (PyG NeighborLoader), matching
     Algorithm 2's "sample local neighbor set N(u) for each u in V_B" exactly,
-  - use class-weighted BCE (Eq. 9) + the real vCLUB mutual-information upper bound
+  - use class-weighted BCE (Eq. 13) + the real vCLUB mutual-information upper bound
     (Eq. 7) instead of a cosine-orthogonality proxy,
   - run an explicit MLTM self-supervised pretraining stage (Eq. 3-5) before joint
     training, matching the paper's "after convergence" description of h_tab,
-  - report PER-CLASS AUROC / AUPRC / F1 in addition to the macro average, and
-  - repeat the whole pipeline over Config.NUM_RUNS seeds for mean +/- std (Table 7/8).
+  - report PER-CLASS AUROC / AUPRC / F1 in addition to the macro average,
+  - repeat the whole pipeline over Config.NUM_RUNS seeds for mean +/- std (Table 7/8),
+  - support Scenario A (prospective, report-free) vs Scenario B (retrospective, full
+    model) as two separately trained/evaluated models (Table 2 / Ablation Study),
+    via Config.SCENARIO for a single run or `--ablation` for both.
 
 Run `preprocessing/build_mimic_dataset.py` first to produce the three CSVs and
 the training graph this script expects.
 """
+import argparse
 import os
 import json
 import random
@@ -62,7 +66,8 @@ def collate_indices(dataset: MimicCxrIvDataset, indices):
 
 
 def pretrain_mltm(model: RelFuseNet, train_ds: MimicCxrIvDataset):
-    """Stage 1 (Eq. 3-5): self-supervised reconstruction pretraining of MLTM alone."""
+    """Stage 1 (Eq. 3-5): self-supervised reconstruction pretraining of MLTM alone.
+    Scenario-independent: MLTM only ever touches the tabular branch."""
     print("[MLTM] Stage 1: self-supervised pretraining ...")
     loader = DataLoader(
         list(range(len(train_ds))), batch_size=Config.BATCH_SIZE, shuffle=True
@@ -77,8 +82,8 @@ def pretrain_mltm(model: RelFuseNet, train_ds: MimicCxrIvDataset):
             obs = batch["tabular_observed_mask"].to(Config.DEVICE)
 
             opt.zero_grad()
-            _, x_hat, art_mask = model.mltm_enc(tab, obs, training=True)
-            loss = mltm_reconstruction_loss(tab, x_hat, obs, art_mask)
+            _, x_hat, a = model.mltm_enc(tab, obs, training=True)
+            loss = mltm_reconstruction_loss(tab, x_hat, a)
             loss.backward()
             opt.step()
             total += loss.item()
@@ -96,7 +101,7 @@ def build_full_graph(edge_index_train: torch.Tensor, n_train: int, extra_edges: 
     return Data(x=x_placeholder, edge_index=edge_index, num_nodes=n_total)
 
 
-def run_epoch_train(model, train_ds, edge_index_train, bce, vclubs, vclub_opts, opt, n_train):
+def run_epoch_train(model, train_ds, edge_index_train, bce, vclubs, vclub_opts, opt, n_train, scenario):
     model.train()
     graph = build_full_graph(edge_index_train, n_train)
     loader = NeighborLoader(
@@ -123,7 +128,7 @@ def run_epoch_train(model, train_ds, edge_index_train, bce, vclubs, vclub_opts, 
         lbl = raw["label"][:n_seed].to(Config.DEVICE)
 
         opt.zero_grad()
-        out = model(img, txt, mask, tab, tab_obs, local_edge_index, training=True)
+        out = model(img, txt, mask, tab, tab_obs, local_edge_index, training=True, scenario=scenario)
 
         logits_seed = out["logits"][:n_seed]
         loss_cls = bce(logits_seed, lbl)
@@ -150,7 +155,7 @@ def run_epoch_train(model, train_ds, edge_index_train, bce, vclubs, vclub_opts, 
 
 
 @torch.no_grad()
-def evaluate(model, train_ds, eval_ds, edge_index_train, n_train):
+def evaluate(model, train_ds, eval_ds, edge_index_train, n_train, scenario):
     """Inductive evaluation: eval_ds nodes are attached ONLY to training nodes."""
     model.eval()
     extra_edges = attach_inductive_nodes(
@@ -203,7 +208,7 @@ def evaluate(model, train_ds, eval_ds, edge_index_train, n_train):
         tab_obs = _cat("tabular_observed_mask")[perm].to(Config.DEVICE)
         lbl = _cat("label")[perm][:n_seed]
 
-        out = model(img, txt, mask, tab, tab_obs, local_edge_index, training=False)
+        out = model(img, txt, mask, tab, tab_obs, local_edge_index, training=False, scenario=scenario)
         all_logits.append(out["logits"][:n_seed].cpu())
         all_labels.append(lbl)
 
@@ -229,9 +234,10 @@ def evaluate(model, train_ds, eval_ds, edge_index_train, n_train):
     return {"per_class": per_class, "macro": macro}
 
 
-def run_one_seed(seed: int):
+def run_one_seed(seed: int, scenario: str = None):
+    scenario = Config.SCENARIO if scenario is None else scenario
     set_seed(seed)
-    print(f"\n=== Run with seed={seed} ===")
+    print(f"\n=== Run with seed={seed}, scenario={scenario} ===")
 
     tokenizer_id = Config.LLM_ID if Config.USE_REAL_LLM else "distilbert-base-uncased"
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_id)
@@ -253,10 +259,10 @@ def run_one_seed(seed: int):
 
     pretrain_mltm(model, train_ds)
 
-    pos_weight = WeightedBCELoss.compute_pos_weight(
+    class_weight = WeightedBCELoss.compute_class_weight(
         torch.stack([train_ds[i]["label"] for i in range(len(train_ds))])
     )
-    bce = WeightedBCELoss(pos_weight).to(Config.DEVICE)
+    bce = WeightedBCELoss(class_weight).to(Config.DEVICE)
 
     vclubs = {k: VCLUBLoss(Config.PROJ_DIM, Config.VCLUB_HIDDEN).to(Config.DEVICE) for k in ("img", "text", "tab")}
     vclub_opts = {k: optim.Adam(v.parameters(), lr=1e-3) for k, v in vclubs.items()}
@@ -265,41 +271,63 @@ def run_one_seed(seed: int):
     opt = optim.AdamW(main_params, lr=Config.LR, weight_decay=Config.WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=Config.EPOCHS, eta_min=Config.LR_MIN)
 
+    ckpt_path = f"relfusenet_best_seed{seed}_scenario{scenario}.pth"
     best_val_auc = 0.0
     for epoch in range(Config.EPOCHS):
-        train_loss = run_epoch_train(model, train_ds, edge_index_train, bce, vclubs, vclub_opts, opt, n_train)
+        train_loss = run_epoch_train(model, train_ds, edge_index_train, bce, vclubs, vclub_opts, opt, n_train, scenario)
         scheduler.step()
 
-        val_metrics = evaluate(model, train_ds, val_ds, edge_index_train, n_train)
+        val_metrics = evaluate(model, train_ds, val_ds, edge_index_train, n_train, scenario)
         val_auc = val_metrics["macro"]["auc"]
-        print(f"Epoch {epoch + 1}/{Config.EPOCHS} | train_loss={train_loss:.4f} | val_macro_AUC={val_auc:.4f}")
+        print(f"[{scenario}] Epoch {epoch + 1}/{Config.EPOCHS} | train_loss={train_loss:.4f} | val_macro_AUC={val_auc:.4f}")
 
         if val_auc > best_val_auc:
             best_val_auc = val_auc
-            torch.save(model.state_dict(), f"relfusenet_best_seed{seed}.pth")
+            torch.save(model.state_dict(), ckpt_path)
 
-    model.load_state_dict(torch.load(f"relfusenet_best_seed{seed}.pth"))
-    test_metrics = evaluate(model, train_ds, test_ds, edge_index_train, n_train)
-    print(f"[Seed {seed}] TEST macro AUC={test_metrics['macro']['auc']:.4f} "
+    model.load_state_dict(torch.load(ckpt_path))
+    test_metrics = evaluate(model, train_ds, test_ds, edge_index_train, n_train, scenario)
+    print(f"[Seed {seed}, scenario {scenario}] TEST macro AUC={test_metrics['macro']['auc']:.4f} "
           f"F1={test_metrics['macro']['f1']:.4f} AUPRC={test_metrics['macro']['auprc']:.4f}")
     return test_metrics
 
 
-def main():
-    all_runs = []
-    for seed in range(Config.SEED, Config.SEED + Config.NUM_RUNS):
-        all_runs.append(run_one_seed(seed))
-
+def _summarize_and_save(all_runs, out_path):
     macro_aucs = [r["macro"]["auc"] for r in all_runs]
     macro_f1s = [r["macro"]["f1"] for r in all_runs]
-    print("\n=== Final (mean +/- std over {} runs) ===".format(Config.NUM_RUNS))
+    print(f"\n=== Final (mean +/- std over {len(all_runs)} runs) ===")
     print(f"Macro AUC: {np.mean(macro_aucs):.4f} +/- {np.std(macro_aucs):.4f}")
     print(f"Macro F1:  {np.mean(macro_f1s):.4f} +/- {np.std(macro_f1s):.4f}")
-
-    with open("relfusenet_results.json", "w") as f:
+    with open(out_path, "w") as f:
         json.dump(all_runs, f, indent=2)
-    print("Full per-class results for every run saved to relfusenet_results.json")
+    print(f"Full per-class results for every run saved to {out_path}")
+
+
+def main():
+    """Default entry point: trains/evaluates a single scenario (Config.SCENARIO,
+    default 'B', the full model) over Config.NUM_RUNS seeds -- this is what
+    produces the paper's main results table."""
+    all_runs = [run_one_seed(seed, Config.SCENARIO) for seed in range(Config.SEED, Config.SEED + Config.NUM_RUNS)]
+    _summarize_and_save(all_runs, f"relfusenet_results_scenario{Config.SCENARIO}.json")
+
+
+def run_ablation():
+    """Trains/evaluates BOTH scenarios (Config.SCENARIOS_FOR_ABLATION, i.e. "A"
+    prospective/report-free and "B" retrospective/full) over Config.NUM_RUNS seeds
+    each, as two separately trained models. This produces the paper's Ablation
+    Study numbers for "Prospective (report-free) vs. retrospective evaluation"."""
+    for scenario in Config.SCENARIOS_FOR_ABLATION:
+        all_runs = [run_one_seed(seed, scenario) for seed in range(Config.SEED, Config.SEED + Config.NUM_RUNS)]
+        _summarize_and_save(all_runs, f"relfusenet_results_scenario{scenario}.json")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ablation", action="store_true",
+                         help="Train/evaluate both Scenario A and Scenario B for the ablation study, "
+                              "instead of just Config.SCENARIO.")
+    args = parser.parse_args()
+    if args.ablation:
+        run_ablation()
+    else:
+        main()
