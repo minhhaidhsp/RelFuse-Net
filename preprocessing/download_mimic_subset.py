@@ -64,12 +64,28 @@ in this repo expect, once you point their path constants here):
 
 Usage
 -----
-    python download_mimic_subset.py --username hainguyen83 --n-patients 2000
+    Test authentication FIRST, before sampling/downloading anything:
+        python download_mimic_subset.py --username hainguyen83 --check-access
+
+    Then the real run:
+        python download_mimic_subset.py --username hainguyen83 --n-patients 2000
 
 You will be prompted for your PhysioNet password (or export
-PHYSIONET_PASSWORD beforehand so it isn't typed interactively). The
-password is only kept in memory for this run -- it is never written to
-disk or printed.
+PHYSIONET_PASSWORD beforehand so it isn't typed interactively, or use
+--password-file). The password is only kept in memory for this run -- it
+is never written to disk or printed.
+
+AUTHENTICATION METHOD: by default (--auth-method session) this logs in
+through PhysioNet's normal web login form and reuses the resulting session
+cookie for every download, because plain HTTP Basic Auth (the old
+`wget --user --ask-password` / `curl -u` approach, --auth-method basic
+here) has been observed returning 403 Forbidden on controlled-access
+projects' /files/ endpoints as of September 2026, even for accounts with
+confirmed, valid project access and a verified-correct password -- while
+the exact same account's ordinary browser session downloads the same
+files without any issue. If --check-access still fails under the default
+session method, this is very likely a PhysioNet-side policy/technical
+issue outside this script's control -- email contact@physionet.org.
 
 Useful flags
 ------------
@@ -91,12 +107,15 @@ import base64
 import csv
 import getpass
 import gzip
+import http.cookiejar
 import io
 import os
 import random
+import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from collections import defaultdict
@@ -128,21 +147,102 @@ VIEW_PRIORITY = ["PA", "AP", "LATERAL", "LL"]
 # so we do the same thing manually below, instead of relying on urllib's
 # reactive auth handler.
 
+class AuthContext:
+    """Carries whatever is needed to make an authenticated request to PhysioNet:
+    an opener (plain, or cookie-backed for session mode) plus the headers to
+    send on every request. `open_url` below only ever talks to this, not to
+    the two auth methods directly, so both are interchangeable."""
+    __slots__ = ("opener", "headers")
+
+    def __init__(self, opener, headers):
+        self.opener = opener
+        self.headers = headers
+
+
+def make_session_auth_context(username, password) -> "AuthContext":
+    """
+    Logs in through PhysioNet's normal Django login form (GET /login/ for a
+    CSRF token, then POST username/password/csrfmiddlewaretoken -- exactly
+    what a browser does) and returns an AuthContext backed by the resulting
+    session cookie.
+
+    WHY THIS EXISTS: as observed in September 2026, PhysioNet's /files/
+    endpoints reject plain pre-emptive HTTP Basic Auth (`wget --user --ask-
+    password`, `curl -u`) with a 403 for controlled-access projects EVEN for
+    an account with confirmed, valid project access and a verified-correct
+    password -- while the same account's ordinary browser session downloads
+    the same files without issue (the 403 response body also renders as if
+    logged out, e.g. showing a "Log in" nav link, which is what pointed at a
+    session/cookie problem rather than a credentials problem). Replicating
+    the browser's session-cookie login is the natural fix to try; this has
+    NOT been confirmed against the real site from this sandbox (no network
+    egress to physionet.org from here) -- run with --check-access first and
+    report back what happens. If PhysioNet's login page markup differs from
+    what's assumed here, or this also 403s, use `--auth-method basic` to
+    fall back to the old behavior, and/or email contact@physionet.org.
+    """
+    cj = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+    ua_headers = {"User-Agent": "download_mimic_subset.py"}
+    login_url = f"{PHYSIONET_HOST}/login/"
+
+    get_resp = opener.open(urllib.request.Request(login_url, headers=ua_headers), timeout=30)
+    html = get_resp.read().decode("utf-8", errors="ignore")
+    m = re.search(r'name="csrfmiddlewaretoken"\s+value="([^"]+)"', html)
+    if not m:
+        raise RuntimeError(
+            "Could not find a csrfmiddlewaretoken input on https://physionet.org/login/ -- "
+            "the login page's markup may not match what this script expects. Try "
+            "--auth-method basic, or update the regex in make_session_auth_context()."
+        )
+    csrf_token = m.group(1)
+
+    post_data = urllib.parse.urlencode({
+        "username": username,
+        "password": password,
+        "csrfmiddlewaretoken": csrf_token,
+    }).encode("utf-8")
+    post_req = urllib.request.Request(
+        login_url,
+        data=post_data,
+        headers={**ua_headers, "Referer": login_url, "Content-Type": "application/x-www-form-urlencoded"},
+    )
+    post_resp = opener.open(post_req, timeout=30)
+    body = post_resp.read().decode("utf-8", errors="ignore")
+    final_url = post_resp.geturl()
+    if final_url.rstrip("/").endswith("/login") or 'name="csrfmiddlewaretoken"' in body:
+        raise RuntimeError(
+            "PhysioNet login POST did not redirect away from /login/ -- username/password "
+            "were likely rejected (this is a DIFFERENT failure than the old Basic-Auth 403; "
+            "double check them directly at https://physionet.org/login/ in a browser)."
+        )
+    return AuthContext(opener, ua_headers)
+
+
+def make_basic_auth_context(username, password) -> "AuthContext":
+    """Legacy auth method: pre-emptive HTTP Basic Auth, kept behind
+    --auth-method basic for A/B testing against make_session_auth_context.
+    See that function's docstring for why session mode is now the default."""
+    headers = make_auth_headers(username, password)
+    return AuthContext(urllib.request.build_opener(), headers)
+
+
 def make_auth_headers(username, password):
     token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
     return {"Authorization": f"Basic {token}", "User-Agent": "download_mimic_subset.py"}
 
 
-def open_url(url, headers, retries=3, backoff=2.0):
-    """Open a URL for streaming reads, pre-emptively authenticated, with a
-    few retries on transient errors. Raises with the HTTP status code on
+def open_url(url, auth: "AuthContext", retries=3, backoff=2.0):
+    """Open a URL for streaming reads, authenticated via `auth` (either
+    session-cookie or legacy Basic-Auth -- see AuthContext), with a few
+    retries on transient errors. Raises with the HTTP status code on
     failure, so a wrong password (401/403) is distinguishable from a wrong
     filename (404)."""
     last_err = None
     for attempt in range(1, retries + 1):
         try:
-            req = urllib.request.Request(url, headers=headers)
-            return urllib.request.urlopen(req, timeout=60)
+            req = urllib.request.Request(url, headers=auth.headers)
+            return auth.opener.open(req, timeout=60)
         except urllib.error.HTTPError as e:
             last_err = e
             if e.code in (401, 403):
@@ -161,14 +261,14 @@ def open_url(url, headers, retries=3, backoff=2.0):
     raise RuntimeError(f"Failed to open {url}: {last_err}")
 
 
-def download_file(headers, url, dest: Path, min_size=1, quiet=False):
+def download_file(auth: "AuthContext", url, dest: Path, min_size=1, quiet=False):
     """Download a whole (small/medium) file. Skips if dest already exists non-empty."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists() and dest.stat().st_size >= min_size:
         return True
     tmp = dest.with_suffix(dest.suffix + ".part")
     try:
-        resp = open_url(url, headers)
+        resp = open_url(url, auth)
         with open(tmp, "wb") as f:
             while True:
                 chunk = resp.read(1 << 20)
@@ -187,14 +287,14 @@ def download_file(headers, url, dest: Path, min_size=1, quiet=False):
         return False
 
 
-def download_and_gunzip(headers, url, dest_csv: Path, quiet=False):
+def download_and_gunzip(auth: "AuthContext", url, dest_csv: Path, quiet=False):
     """Download a .csv.gz and write the decompressed .csv to dest_csv."""
     if dest_csv.exists() and dest_csv.stat().st_size > 0:
         return True
     dest_csv.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest_csv.with_suffix(dest_csv.suffix + ".part")
     try:
-        resp = open_url(url, headers)
+        resp = open_url(url, auth)
         with gzip.GzipFile(fileobj=resp) as gz, open(tmp, "wb") as out:
             while True:
                 chunk = gz.read(1 << 20)
@@ -213,7 +313,7 @@ def download_and_gunzip(headers, url, dest_csv: Path, quiet=False):
         return False
 
 
-def stream_filter_gz_csv(headers, url, dest_csv: Path, subject_col, subject_ids, quiet=False):
+def stream_filter_gz_csv(auth: "AuthContext", url, dest_csv: Path, subject_col, subject_ids, quiet=False):
     """
     Stream a remote .csv.gz row by row, writing only rows whose `subject_col`
     is in `subject_ids` to dest_csv. The full remote table is decompressed
@@ -226,7 +326,7 @@ def stream_filter_gz_csv(headers, url, dest_csv: Path, subject_col, subject_ids,
     subject_ids = {str(s) for s in subject_ids}
     fname = url.rsplit("/", 1)[-1]
     try:
-        resp = open_url(url, headers)
+        resp = open_url(url, auth)
     except Exception as e:
         print(f"  FAILED to open {url}: {e}", file=sys.stderr)
         return False
@@ -333,6 +433,13 @@ def main():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("--username", required=True, help="Your PhysioNet username")
+    ap.add_argument(
+        "--auth-method", choices=["session", "basic"], default="session",
+        help="'session' (default) logs in like a browser (POST /login/, then a session "
+             "cookie) -- try this first. 'basic' is the old pre-emptive HTTP Basic Auth "
+             "method, kept for A/B testing since PhysioNet has been observed rejecting it "
+             "(403) for controlled-access projects even with correct credentials.",
+    )
     ap.add_argument("--n-patients", type=int, default=2000, help="Number of subjects to sample")
     ap.add_argument("--out-dir", default="./data/mimic_subset", help="Local output directory")
     ap.add_argument("--cxr-jpg-version", default="2.1.0")
@@ -374,7 +481,10 @@ def main():
         password = os.environ.get("PHYSIONET_PASSWORD") or getpass.getpass(
             f"PhysioNet password for {args.username}: "
         )
-    headers = make_auth_headers(args.username, password)
+    if args.auth_method == "session":
+        auth = make_session_auth_context(args.username, password)
+    else:
+        auth = make_basic_auth_context(args.username, password)
 
     if args.check_access:
         print("== Access check only (--check-access): no cohort sampling, no download ==")
@@ -385,7 +495,7 @@ def main():
         all_ok = True
         for label, url in checks:
             try:
-                resp = open_url(url, headers)
+                resp = open_url(url, auth)
                 resp.read(1)  # just confirm we can read a byte
                 print(f"  [OK]  {label}: authenticated successfully ({url})")
             except Exception as e:
@@ -407,7 +517,7 @@ def main():
         "mimic-cxr-2.0.0-split.csv.gz": cxr_local / "mimic-cxr-2.0.0-split.csv",
     }
     for fname, dest in meta_files.items():
-        ok = download_and_gunzip(headers, f"{cxr_base}/{fname}", dest)
+        ok = download_and_gunzip(auth, f"{cxr_base}/{fname}", dest)
         if not ok:
             print(f"  NOTE: if this 404s, check the exact filename on "
                   f"https://physionet.org/content/mimic-cxr-jpg/{args.cxr_jpg_version}/ "
@@ -453,7 +563,7 @@ def main():
 
     print("== Step 3/5: radiology reports (extract sampled subjects only) ==")
     reports_zip = out_dir / "mimic-cxr-reports.zip"
-    if download_file(headers, f"{reports_base}/mimic-cxr-reports.zip", reports_zip, min_size=1_000_000):
+    if download_file(auth, f"{reports_base}/mimic-cxr-reports.zip", reports_zip, min_size=1_000_000):
         reports_out = out_dir / "reports"
         reports_out.mkdir(parents=True, exist_ok=True)
         wanted_tokens = {f"p{sid}" for sid in subjects}
@@ -473,7 +583,7 @@ def main():
         for i, (sid, study_id, dicom_id) in enumerate(manifest_rows, 1):
             rel = f"{cxr_relative_dir(sid)}/s{study_id}/{dicom_id}.jpg"
             dest = cxr_local / rel
-            if download_file(headers, f"{cxr_base}/{rel}", dest, min_size=1000, quiet=True):
+            if download_file(auth, f"{cxr_base}/{rel}", dest, min_size=1000, quiet=True):
                 ok_n += 1
             else:
                 fail_n += 1
@@ -486,14 +596,14 @@ def main():
     if not args.skip_hosp:
         print("== Step 5/5: MIMIC-IV hosp tables (streamed + filtered to sampled subjects) ==")
         for fname in ["d_icd_diagnoses.csv.gz", "d_icd_procedures.csv.gz", "d_hcpcs.csv.gz", "d_labitems.csv.gz"]:
-            download_and_gunzip(headers, f"{hosp_base}/{fname}", hosp_local / fname.replace(".gz", ""))
+            download_and_gunzip(auth, f"{hosp_base}/{fname}", hosp_local / fname.replace(".gz", ""))
 
         wanted_tables = [t.strip() for t in args.hosp_tables.split(",") if t.strip()]
         for table in wanted_tables:
             fname = f"{table}.csv.gz"
             print(f"  streaming {fname} (this can take a while for labevents)...")
             stream_filter_gz_csv(
-                headers, f"{hosp_base}/{fname}", hosp_local / f"{table}.csv",
+                auth, f"{hosp_base}/{fname}", hosp_local / f"{table}.csv",
                 subject_col="subject_id", subject_ids=subjects,
             )
     else:
