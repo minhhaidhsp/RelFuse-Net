@@ -208,13 +208,21 @@ def make_session_auth_context(username, password) -> "AuthContext":
         headers={**ua_headers, "Referer": login_url, "Content-Type": "application/x-www-form-urlencoded"},
     )
     post_resp = opener.open(post_req, timeout=30)
-    body = post_resp.read().decode("utf-8", errors="ignore")
-    final_url = post_resp.geturl()
-    if final_url.rstrip("/").endswith("/login") or 'name="csrfmiddlewaretoken"' in body:
+    post_resp.read()  # drain the body; not used for the success check (see below)
+
+    # The reliable success signal is a `sessionid` cookie -- Django only sets one on a
+    # successful login. Checking the final URL or "is there a csrfmiddlewaretoken in the
+    # body" is NOT reliable: PhysioNet's /projects/ landing page (and most other pages)
+    # also contain a csrfmiddlewaretoken input for some other form on the page, so that
+    # check produces a false "still on login page" failure even after a real, successful
+    # login (confirmed 2026-09-19: final url was /projects/ and a sessionid cookie was
+    # present, yet the old check here still raised).
+    if not any(c.name == "sessionid" for c in cj):
         raise RuntimeError(
-            "PhysioNet login POST did not redirect away from /login/ -- username/password "
-            "were likely rejected (this is a DIFFERENT failure than the old Basic-Auth 403; "
-            "double check them directly at https://physionet.org/login/ in a browser)."
+            "PhysioNet login POST completed but no 'sessionid' cookie was issued -- "
+            "username/password were likely rejected. Double check them directly at "
+            "https://physionet.org/login/ in a browser (this is a DIFFERENT failure "
+            "than the old Basic-Auth 403)."
         )
     return AuthContext(opener, ua_headers)
 
