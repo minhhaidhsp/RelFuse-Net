@@ -35,7 +35,7 @@ class Config:
     # preprocessing/download_mimic_subset.py), switch this single prefix from
     # "./data/mimic_seed" to "./data/mimic_subset" -- nothing else below needs
     # to change, the two scripts write an identical directory layout.
-    _MIMIC_ROOT = "./data/mimic_seed"          # <-- swap to "./data/mimic_subset" for real data
+    _MIMIC_ROOT = "./data/mimic_subset"        # real PhysioNet MIMIC-CXR-JPG + MIMIC-IV data (was ./data/mimic_seed synthetic)
     _CXR_JPG_VERSION = "2.1.0"
     _MIMIC_IV_VERSION = "3.1"
 
@@ -43,6 +43,7 @@ class Config:
     MIMIC_CXR_METADATA_CSV = f"{MIMIC_CXR_JPG_DIR}/mimic-cxr-2.0.0-metadata.csv"
     MIMIC_CXR_CHEXPERT_CSV = f"{MIMIC_CXR_JPG_DIR}/mimic-cxr-2.0.0-chexpert.csv"
     MIMIC_CXR_SPLIT_CSV = f"{MIMIC_CXR_JPG_DIR}/mimic-cxr-2.0.0-split.csv"
+    MIMIC_CXR_REPORTS_DIR = f"{_MIMIC_ROOT}/reports/files"  # download_mimic_subset.py extracts reports here (separate tree from the JPG dir)
     MIMIC_IV_HOSP_DIR = f"{_MIMIC_ROOT}/mimiciv/{_MIMIC_IV_VERSION}/hosp"
 
     # --- Processed / pipeline output paths ---

@@ -31,8 +31,11 @@ import numpy as np
 import pandas as pd
 
 from config import Config
-from graph_utils import build_patient_graph
-import torch
+# torch (and graph_utils, which itself imports torch) are only needed for the very
+# last step (building + saving the training graph). Importing them lazily lets the
+# rest of this script's pandas-only logic run for testing in a torch-less environment.
+if False:
+    import torch  # noqa: F401  (type-checker hint only; real import is lazy below)
 
 CHEXPERT_LABELS = [
     "No Finding", "Enlarged Cardiomediastinum", "Cardiomegaly", "Lung Opacity",
@@ -134,12 +137,12 @@ def select_representative_view(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_report_text_lookup(row) -> str:
-    """MIMIC-CXR-JPG ships free-text reports as
-    files/p<first2-of-subject>/p<subject_id>/s<study_id>.txt. Returning "" makes
-    a row ineligible downstream (eligibility criterion 2)."""
+    """Free-text reports are extracted by download_mimic_subset.py into their own
+    tree (Config.MIMIC_CXR_REPORTS_DIR), separate from the JPG dir:
+    reports/files/p<first2-of-subject>/p<subject_id>/s<study_id>.txt. Returning ""
+    makes a row ineligible downstream (eligibility criterion 2)."""
     report_path = os.path.join(
-        Config.MIMIC_CXR_JPG_DIR,
-        "files",
+        Config.MIMIC_CXR_REPORTS_DIR,
         f"p{str(row['subject_id'])[:2]}",
         f"p{row['subject_id']}",
         f"s{row['study_id']}.txt",
@@ -317,6 +320,8 @@ def main():
 
     # --- Training-set graph (Section 3.1.2), built ONCE, train admissions only ---
     print("Building the training-set patient-similarity graph ...")
+    import torch
+    from graph_utils import build_patient_graph
     edge_index = build_patient_graph(
         df_train["icd_history"].tolist(), df_train["cpt_codes"].tolist(), Config.CPT_OVERLAP_THRESHOLD
     )
