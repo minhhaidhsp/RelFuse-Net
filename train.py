@@ -159,17 +159,34 @@ def run_epoch_train(model, train_ds, edge_index_train, bce, vclubs, vclub_opts, 
     return total_loss / max(n_batches, 1)
 
 
-@torch.no_grad()
-def evaluate(model, train_ds, eval_ds, edge_index_train, n_train, scenario):
-    """Inductive evaluation: eval_ds nodes are attached ONLY to training nodes."""
-    model.eval()
+def build_eval_graph(train_ds, eval_ds, edge_index_train, n_train):
+    """Precompute the inductive-attachment graph for one held-out split (val or
+    test) ONCE per run. `evaluate()` used to rebuild this from scratch -- including
+    attach_inductive_nodes()'s O(n_train * n_eval) pairwise ICD/CPT-overlap check --
+    on every single call, even though train_ds/eval_ds's ICD and CPT histories are
+    completely static for the whole run (they don't depend on model weights or the
+    current epoch), so the result is identical every time. Since evaluate() is
+    called once per epoch for the validation split, that meant redoing this same
+    expensive computation Config.EPOCHS times for no reason. Purely a performance
+    fix: produces byte-for-byte the same graph evaluate() used to build inline."""
     extra_edges = attach_inductive_nodes(
         train_ds.icd_histories, train_ds.cpt_codes,
         eval_ds.icd_histories, eval_ds.cpt_codes,
         Config.CPT_OVERLAP_THRESHOLD,
     )
     n_eval = len(eval_ds)
-    graph = build_full_graph(edge_index_train, n_train, extra_edges, n_eval)
+    return build_full_graph(edge_index_train, n_train, extra_edges, n_eval)
+
+
+@torch.no_grad()
+def evaluate(model, train_ds, eval_ds, graph, n_train, scenario):
+    """Inductive evaluation: eval_ds nodes are attached ONLY to training nodes.
+    `graph` must come from build_eval_graph(train_ds, eval_ds, edge_index_train,
+    n_train) -- build it once per run (see that function's docstring) and pass the
+    same object in on every call for a given eval_ds, rather than rebuilding it
+    here on every call."""
+    model.eval()
+    n_eval = len(eval_ds)
 
     loader = NeighborLoader(
         graph,
@@ -307,6 +324,12 @@ def run_one_seed(seed: int, scenario: str = None):
     edge_index_train = torch.load(Config.GRAPH_EDGES_TRAIN)
     n_train = len(train_ds)
 
+    # Built once (see build_eval_graph's docstring): eval_ds's ICD/CPT histories
+    # never change during this run, so the inductive-attachment graph they produce
+    # doesn't either -- reused across every epoch's validation pass below instead
+    # of being recomputed from scratch each time.
+    val_graph = build_eval_graph(train_ds, val_ds, edge_index_train, n_train)
+
     model = RelFuseNet().to(Config.DEVICE)
 
     pretrain_mltm(model, train_ds)
@@ -338,7 +361,7 @@ def run_one_seed(seed: int, scenario: str = None):
         train_loss = run_epoch_train(model, train_ds, edge_index_train, bce, vclubs, vclub_opts, opt, n_train, scenario)
         scheduler.step()
 
-        val_metrics = evaluate(model, train_ds, val_ds, edge_index_train, n_train, scenario)
+        val_metrics = evaluate(model, train_ds, val_ds, val_graph, n_train, scenario)
         val_auc = val_metrics["macro"]["auc"]
         print(f"[{scenario}] Epoch {epoch + 1}/{Config.EPOCHS} | train_loss={train_loss:.4f} | val_macro_AUC={val_auc:.4f}")
 
@@ -352,7 +375,8 @@ def run_one_seed(seed: int, scenario: str = None):
         os.remove(resume_path)  # this seed/scenario finished cleanly; nothing left to resume
 
     model.load_state_dict(torch.load(ckpt_path))
-    test_metrics = evaluate(model, train_ds, test_ds, edge_index_train, n_train, scenario)
+    test_graph = build_eval_graph(train_ds, test_ds, edge_index_train, n_train)
+    test_metrics = evaluate(model, train_ds, test_ds, test_graph, n_train, scenario)
     print(f"[Seed {seed}, scenario {scenario}] TEST macro AUC={test_metrics['macro']['auc']:.4f} "
           f"F1={test_metrics['macro']['f1']:.4f} AUPRC={test_metrics['macro']['auprc']:.4f}")
     return test_metrics

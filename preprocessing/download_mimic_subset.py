@@ -95,6 +95,16 @@ Useful flags
     --hosp-tables       comma-separated subset, e.g. "admissions,diagnoses_icd"
                         (drop "labevents" here first if you want a quick trial run --
                         it is by far the slowest table to stream-filter)
+    --workers N         parallel download threads for Step 4 (chest X-ray JPEGs).
+                        Default 8. Each JPEG is an independent HTTP request, so
+                        Step 4 was the slow part running sequentially (one image
+                        at a time); this fetches N images concurrently instead.
+                        Raise it (e.g. 16-24) if your connection has headroom, or
+                        drop it back to 1 (old behavior) if you start seeing lots
+                        of FAILED lines -- that usually means PhysioNet is
+                        throttling too many concurrent connections from one
+                        account/IP. Steps 1/3/5 are unaffected (already fast or
+                        already single large streamed requests).
 
 Re-running is safe: any file that already exists locally with a non-zero
 size is skipped, so an interrupted run can simply be restarted.
@@ -104,6 +114,7 @@ Requires only the Python standard library -- no extra `pip install` needed.
 
 import argparse
 import base64
+import concurrent.futures
 import csv
 import getpass
 import gzip
@@ -112,7 +123,9 @@ import io
 import os
 import random
 import re
+import shutil
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -269,25 +282,146 @@ def open_url(url, auth: "AuthContext", retries=3, backoff=2.0):
     raise RuntimeError(f"Failed to open {url}: {last_err}")
 
 
-def download_file(auth: "AuthContext", url, dest: Path, min_size=1, quiet=False):
-    """Download a whole (small/medium) file. Skips if dest already exists non-empty."""
+# --------------------------------------------------------------------------
+# Live progress bar (stdlib-only -- this script has zero pip requirements,
+# so no tqdm; a small \r-based bar does the same job for our purposes)
+# --------------------------------------------------------------------------
+
+def format_duration(seconds):
+    """12345 -> '3h25m', 90 -> '1m30s', 7 -> '7s'. inf/unknown -> '?'."""
+    if seconds is None or seconds != seconds or seconds == float("inf"):
+        return "?"
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    if m:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
+
+
+def format_bytes(n):
+    """1536 -> '1.5KB', 15_000_000 -> '14.3MB'."""
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}TB"
+
+
+def _content_length(resp):
+    """Best-effort Content-Length from an HTTP response, or None if the
+    server didn't send one (progress bar then falls back to a live rate
+    counter without a % / ETA, since the total is unknown)."""
+    try:
+        val = resp.headers.get("Content-Length")
+        return int(val) if val else None
+    except Exception:
+        return None
+
+
+class CountingReader:
+    """Wraps a file-like object (here: an HTTP response) and counts bytes
+    read through it. Used to drive a progress bar for a gzip stream: we
+    can't know the *decompressed* size or row count ahead of time, but the
+    *compressed* Content-Length is known upfront and tracking bytes read
+    from the underlying (compressed) stream is a good enough proxy for
+    "how far through this file are we"."""
+
+    def __init__(self, fileobj):
+        self._f = fileobj
+        self.bytes_read = 0
+
+    def read(self, n=-1):
+        chunk = self._f.read(n)
+        self.bytes_read += len(chunk)
+        return chunk
+
+
+class ProgressBar:
+    """Minimal live progress bar, redrawn in place with '\\r' -- no external
+    deps. With a known `total` it draws a [####----] NN% bar plus a rate and
+    ETA; with `total=None` (e.g. streaming a remote table whose row count
+    isn't known until fully scanned) it just shows a live running rate.
+    Redraws are throttled to `update_every` seconds so fast loops (e.g. one
+    call per CSV row) don't spend all their time repainting the terminal."""
+
+    def __init__(self, total, label, unit="items", is_bytes=False, width=28, update_every=0.25):
+        self.total = total
+        self.label = label
+        self.unit = unit
+        self.is_bytes = is_bytes
+        self.width = width
+        self.update_every = update_every
+        self.start = time.monotonic()
+        self._last_draw = 0.0
+        self._last_len = 0
+
+    def update(self, done, extra=""):
+        now = time.monotonic()
+        is_final = self.total is not None and done >= self.total
+        if not is_final and (now - self._last_draw) < self.update_every:
+            return
+        self._last_draw = now
+        elapsed = max(now - self.start, 1e-9)
+        rate = done / elapsed
+        d_str = format_bytes(done) if self.is_bytes else f"{done:,}"
+        rate_str = (format_bytes(rate) + "/s") if self.is_bytes else f"{rate * 60:,.1f} {self.unit}/min"
+        if self.total:
+            t_str = format_bytes(self.total) if self.is_bytes else f"{self.total:,}"
+            frac = min(done / self.total, 1.0)
+            filled = int(self.width * frac)
+            bar = "#" * filled + "-" * (self.width - filled)
+            eta = (self.total - done) / rate if rate > 0 else float("inf")
+            line = (f"\r  {self.label} [{bar}] {frac * 100:5.1f}% "
+                    f"({d_str}/{t_str}) {rate_str} ETA {format_duration(eta)} {extra}")
+        else:
+            line = f"\r  {self.label} {d_str} {self.unit} | {rate_str} {extra}"
+        pad = max(self._last_len - len(line), 0)
+        sys.stdout.write(line + (" " * pad))
+        sys.stdout.flush()
+        self._last_len = len(line)
+
+    def close(self):
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+
+def download_file(auth: "AuthContext", url, dest: Path, min_size=1, quiet=False, progress_label=None):
+    """Download a whole (small/medium) file. Skips if dest already exists
+    non-empty. If `progress_label` is given, draws a live byte-progress bar
+    (using the response's Content-Length when the server sends one)."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists() and dest.stat().st_size >= min_size:
         return True
     tmp = dest.with_suffix(dest.suffix + ".part")
+    pb = None
     try:
         resp = open_url(url, auth)
+        if progress_label:
+            pb = ProgressBar(_content_length(resp), progress_label, unit="B", is_bytes=True)
+        written = 0
         with open(tmp, "wb") as f:
             while True:
                 chunk = resp.read(1 << 20)
                 if not chunk:
                     break
                 f.write(chunk)
+                written += len(chunk)
+                if pb:
+                    pb.update(written)
+        if pb:
+            pb.update(written)
+            pb.close()
         tmp.rename(dest)
-        if not quiet:
+        if not quiet and not progress_label:
             print(f"  downloaded {dest.name} ({dest.stat().st_size / 1e6:.2f} MB)")
         return True
     except Exception as e:
+        if pb:
+            pb.close()
         if not quiet:
             print(f"  FAILED {url}: {e}", file=sys.stderr)
         if tmp.exists():
@@ -295,25 +429,38 @@ def download_file(auth: "AuthContext", url, dest: Path, min_size=1, quiet=False)
         return False
 
 
-def download_and_gunzip(auth: "AuthContext", url, dest_csv: Path, quiet=False):
-    """Download a .csv.gz and write the decompressed .csv to dest_csv."""
+def download_and_gunzip(auth: "AuthContext", url, dest_csv: Path, quiet=False, progress_label=None):
+    """Download a .csv.gz and write the decompressed .csv to dest_csv. If
+    `progress_label` is given, draws a live byte-progress bar tracking the
+    *compressed* bytes read (the decompressed size isn't known upfront)."""
     if dest_csv.exists() and dest_csv.stat().st_size > 0:
         return True
     dest_csv.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest_csv.with_suffix(dest_csv.suffix + ".part")
+    pb = None
     try:
         resp = open_url(url, auth)
-        with gzip.GzipFile(fileobj=resp) as gz, open(tmp, "wb") as out:
+        counting = CountingReader(resp)
+        if progress_label:
+            pb = ProgressBar(_content_length(resp), progress_label, unit="B", is_bytes=True)
+        with gzip.GzipFile(fileobj=counting) as gz, open(tmp, "wb") as out:
             while True:
                 chunk = gz.read(1 << 20)
                 if not chunk:
                     break
                 out.write(chunk)
+                if pb:
+                    pb.update(counting.bytes_read)
+        if pb:
+            pb.update(counting.bytes_read)
+            pb.close()
         tmp.rename(dest_csv)
-        if not quiet:
+        if not quiet and not progress_label:
             print(f"  decompressed {dest_csv.name} ({dest_csv.stat().st_size / 1e6:.2f} MB)")
         return True
     except Exception as e:
+        if pb:
+            pb.close()
         if not quiet:
             print(f"  FAILED {url}: {e}", file=sys.stderr)
         if tmp.exists():
@@ -321,27 +468,62 @@ def download_and_gunzip(auth: "AuthContext", url, dest_csv: Path, quiet=False):
         return False
 
 
-def stream_filter_gz_csv(auth: "AuthContext", url, dest_csv: Path, subject_col, subject_ids, quiet=False):
+def stream_filter_gz_csv(auth: "AuthContext", url, dest_csv: Path, subject_col, subject_ids, quiet=False, progress_label=None):
     """
     Stream a remote .csv.gz row by row, writing only rows whose `subject_col`
     is in `subject_ids` to dest_csv. The full remote table is decompressed
     on the fly but never buffered or written to disk in full -- only the
     matching rows are kept.
+
+    If `progress_label` is given: when the server sends a Content-Length for
+    the (compressed) .csv.gz, draws a real %/ETA bar off compressed bytes
+    read so far (a good proxy for how far through the file we are); if not,
+    falls back to a live rows-scanned-per-second counter with no % (total
+    row count isn't knowable until the whole remote file has been read).
     """
     if dest_csv.exists() and dest_csv.stat().st_size > 0:
         return True
     dest_csv.parent.mkdir(parents=True, exist_ok=True)
     subject_ids = {str(s) for s in subject_ids}
     fname = url.rsplit("/", 1)[-1]
+    # IMPORTANT: write to a .part temp file and only rename to dest_csv on a
+    # fully successful pass (mirrors download_file/download_and_gunzip).
+    # This table is streamed row-by-row and can be large/slow (labevents in
+    # particular -- multi-GB compressed, can take well over an hour), so an
+    # interrupted run (Ctrl+C, dropped connection, killed terminal) is a real
+    # possibility. Writing straight to dest_csv used to mean an interruption
+    # left a half-written file sitting at the final path with non-zero size
+    # -- and the very next run's "if dest_csv.exists() and size > 0: skip"
+    # check would then silently accept that TRUNCATED file as complete,
+    # forever. (Confirmed in practice: an interrupted labevents.csv run left
+    # a well-formed-looking CSV -- valid header, valid last row, proper
+    # trailing newline -- covering only 177 of the 2000 sampled subjects,
+    # and was accepted as "already downloaded" by the next run.) The
+    # `finally` block below also covers KeyboardInterrupt/SystemExit, which
+    # are NOT subclasses of Exception and so are not caught by the `except
+    # Exception` below -- without it, Ctrl+C specifically would still leak a
+    # partial .part file that then gets silently reused... except .part is
+    # never treated as "done" by the skip-check above (only dest_csv is), so
+    # the real risk `finally` closes is a partial .part surviving to be
+    # confused with a fresh, unrelated future attempt; the important
+    # guarantee is simply "dest_csv only ever appears once we know it's
+    # complete".
+    tmp = dest_csv.with_suffix(dest_csv.suffix + ".part")
     try:
         resp = open_url(url, auth)
     except Exception as e:
         print(f"  FAILED to open {url}: {e}", file=sys.stderr)
         return False
 
+    counting = CountingReader(resp)
+    total_compressed = _content_length(resp)
+    pb = ProgressBar(total_compressed, progress_label, unit="B", is_bytes=True) if progress_label else None
+    row_pb = ProgressBar(None, progress_label, unit="rows") if (progress_label and not pb) else None
+
     kept, total = 0, 0
+    success = False
     try:
-        with gzip.GzipFile(fileobj=resp) as gz:
+        with gzip.GzipFile(fileobj=counting) as gz:
             text = io.TextIOWrapper(gz, encoding="utf-8", newline="")
             reader = csv.reader(text)
             header = next(reader)
@@ -349,7 +531,7 @@ def stream_filter_gz_csv(auth: "AuthContext", url, dest_csv: Path, subject_col, 
                 col_idx = header.index(subject_col)
             except ValueError:
                 raise RuntimeError(f"Column '{subject_col}' not found in {fname} header {header}")
-            with open(dest_csv, "w", newline="", encoding="utf-8") as out:
+            with open(tmp, "w", newline="", encoding="utf-8") as out:
                 writer = csv.writer(out)
                 writer.writerow(header)
                 for row in reader:
@@ -357,17 +539,277 @@ def stream_filter_gz_csv(auth: "AuthContext", url, dest_csv: Path, subject_col, 
                     if len(row) > col_idx and row[col_idx] in subject_ids:
                         writer.writerow(row)
                         kept += 1
-                    if not quiet and total % 2_000_000 == 0:
+                    if pb:
+                        pb.update(counting.bytes_read, extra=f"kept {kept:,} of {total:,} rows scanned")
+                    elif row_pb:
+                        row_pb.update(total, extra=f"kept {kept:,}")
+                    elif not quiet and total % 2_000_000 == 0:
                         print(f"    ...scanned {total:,} rows of {fname}, kept {kept:,} so far")
-        if not quiet:
+        if pb:
+            pb.update(counting.bytes_read, extra=f"kept {kept:,} of {total:,} rows scanned")
+            pb.close()
+        elif row_pb:
+            row_pb.update(total, extra=f"kept {kept:,}")
+            row_pb.close()
+        tmp.rename(dest_csv)  # only now does the final path come into existence
+        success = True
+        if not quiet and not progress_label:
             print(f"  filtered {dest_csv.name}: kept {kept:,} / {total:,} rows")
         return True
     except Exception as e:
+        if pb:
+            pb.close()
+        if row_pb:
+            row_pb.close()
         if not quiet:
             print(f"  FAILED {url}: {e}", file=sys.stderr)
-        if dest_csv.exists():
-            dest_csv.unlink()
         return False
+    finally:
+        # Runs on the success path too (harmless: tmp is already renamed away
+        # by then, so tmp.exists() is False) and on ANY exit that isn't a
+        # clean success -- including Ctrl+C, which `except Exception` above
+        # does not catch.
+        if not success and tmp.exists():
+            tmp.unlink()
+
+
+def _probe_range_support(auth: "AuthContext", url):
+    """Send a tiny Range request (bytes=0-0) to find out whether the server
+    honors HTTP Range requests (206 Partial Content + Content-Range) and
+    what the file's total size is. Returns (supports_range: bool,
+    total_size: int|None). If the probe itself fails for any reason, falls
+    back to a plain request just to learn the total size, and reports
+    supports_range=False (the safe assumption)."""
+    req_headers = dict(auth.headers)
+    req_headers["Range"] = "bytes=0-0"
+    try:
+        req = urllib.request.Request(url, headers=req_headers)
+        resp = auth.opener.open(req, timeout=30)
+        code = getattr(resp, "status", None) or resp.getcode()
+        content_range = resp.headers.get("Content-Range")  # "bytes 0-0/2481234567"
+        resp.close()
+        if code == 206 and content_range and "/" in content_range:
+            return True, int(content_range.rsplit("/", 1)[-1])
+    except Exception:
+        pass
+    try:
+        resp = open_url(url, auth)
+        total = _content_length(resp)
+        resp.close()
+        return False, total
+    except Exception:
+        return False, None
+
+
+def download_range_resumable(auth: "AuthContext", url, dest_raw: Path, workers=4,
+                              progress_label=None, quiet=False):
+    """
+    Download a (potentially very large) file to dest_raw with two properties
+    the plain streaming approach doesn't have -- built specifically for
+    tables like labevents.csv.gz (multi-GB compressed) where a single slow/
+    throttled connection can mean a 24h+ download that loses ALL progress
+    if interrupted:
+
+      1. RESUMABLE AT THE BYTE LEVEL. When the server supports Range
+         requests, the file is split into `workers` contiguous byte ranges,
+         each written to its own on-disk chunk file as bytes arrive. If the
+         process is interrupted, re-running this function re-checks each
+         chunk file's current size on disk and resumes it with
+         `Range: bytes=<already-have>-<chunk-end>` instead of starting that
+         chunk over -- so at most a few seconds of the most recent write per
+         chunk is ever lost, never the whole file.
+      2. PARALLEL. The `workers` chunks download concurrently (same pattern
+         as Step 4's image downloads), which can multiply aggregate
+         throughput when the bottleneck is a per-connection limit rather
+         than a per-account/IP one.
+
+    Falls back to a single-connection download (still resumable via a
+    `Range: bytes=<n>-` continuation, just not parallel) when the server
+    doesn't answer with 206 Partial Content to the initial probe.
+
+    Skips entirely if dest_raw already exists with the full expected size.
+    Returns True only once dest_raw holds the complete file.
+    """
+    dest_raw.parent.mkdir(parents=True, exist_ok=True)
+    supports_range, total = _probe_range_support(auth, url)
+
+    if dest_raw.exists() and total and dest_raw.stat().st_size == total:
+        return True
+
+    if not supports_range or not total or workers <= 1:
+        start = dest_raw.stat().st_size if dest_raw.exists() else 0
+        req_headers = dict(auth.headers)
+        if start:
+            req_headers["Range"] = f"bytes={start}-"
+        pb = ProgressBar(total, progress_label, unit="B", is_bytes=True) if progress_label else None
+        if pb and start:
+            pb.update(start)
+        try:
+            req = urllib.request.Request(url, headers=req_headers)
+            resp = auth.opener.open(req, timeout=60)
+            written = start
+            with open(dest_raw, "ab" if start else "wb") as f:
+                while True:
+                    chunk = resp.read(1 << 20)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    written += len(chunk)
+                    if pb:
+                        pb.update(written)
+            if pb:
+                pb.close()
+            if total and dest_raw.stat().st_size != total:
+                if not quiet:
+                    print(f"  {dest_raw.name}: got {dest_raw.stat().st_size} of {total} bytes "
+                          f"-- re-run to resume.", file=sys.stderr)
+                return False
+            return True
+        except Exception as e:
+            if pb:
+                pb.close()
+            if not quiet:
+                print(f"  FAILED {url}: {e}", file=sys.stderr)
+            return False
+
+    # Parallel, chunked, resumable path.
+    chunk_size = -(-total // workers)  # ceil division
+    ranges = []
+    for i in range(workers):
+        start = i * chunk_size
+        end = min(start + chunk_size, total) - 1
+        if start > end:
+            break
+        ranges.append((start, end))
+
+    chunk_paths = [dest_raw.with_name(dest_raw.name + f".chunk{i}.part") for i in range(len(ranges))]
+    progress = [0] * len(ranges)
+    for i, cp in enumerate(chunk_paths):
+        if cp.exists():
+            progress[i] = min(cp.stat().st_size, ranges[i][1] - ranges[i][0] + 1)
+    lock = threading.Lock()
+    pb = ProgressBar(total, progress_label, unit="B", is_bytes=True) if progress_label else None
+    if pb:
+        pb.update(sum(progress))
+
+    def _fetch_chunk(i):
+        start, end = ranges[i]
+        cp = chunk_paths[i]
+        have = cp.stat().st_size if cp.exists() else 0
+        expected = end - start + 1
+        if have >= expected:
+            return True
+        req_headers = dict(auth.headers)
+        req_headers["Range"] = f"bytes={start + have}-{end}"
+        try:
+            req = urllib.request.Request(url, headers=req_headers)
+            resp = auth.opener.open(req, timeout=60)
+            written = have
+            with open(cp, "ab") as f:
+                while True:
+                    buf = resp.read(1 << 20)
+                    if not buf:
+                        break
+                    f.write(buf)
+                    written += len(buf)
+                    with lock:
+                        progress[i] = written
+                        if pb:
+                            pb.update(sum(progress))
+            return written >= expected
+        except Exception as e:
+            if not quiet:
+                print(f"  {dest_raw.name} chunk {i} FAILED: {e}", file=sys.stderr)
+            return False
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(ranges)) as pool:
+        results = list(pool.map(_fetch_chunk, range(len(ranges))))
+    if pb:
+        pb.close()
+
+    if not all(results):
+        if not quiet:
+            print(f"  {dest_raw.name}: one or more chunks incomplete -- re-run to resume "
+                  f"(completed chunks are kept on disk, nothing is re-downloaded).", file=sys.stderr)
+        return False
+
+    # All chunks complete -- concatenate in order into dest_raw.
+    tmp = dest_raw.with_name(dest_raw.name + ".merge.part")
+    with open(tmp, "wb") as out:
+        for cp in chunk_paths:
+            with open(cp, "rb") as f:
+                shutil.copyfileobj(f, out, length=1 << 20)
+    if tmp.stat().st_size != total:
+        tmp.unlink()
+        if not quiet:
+            print(f"  {dest_raw.name}: merged size mismatch, discarding merge "
+                  f"(chunk files kept for retry).", file=sys.stderr)
+        return False
+    tmp.rename(dest_raw)
+    for cp in chunk_paths:
+        cp.unlink(missing_ok=True)
+    return True
+
+
+def filter_local_gz_csv(raw_gz_path: Path, dest_csv: Path, subject_col, subject_ids,
+                         quiet=False, progress_label=None):
+    """Same row-filtering logic as stream_filter_gz_csv, but reading a
+    .csv.gz that's already fully present on local disk (via
+    download_range_resumable) instead of streaming it off the network. This
+    keeps the slow/flaky network step and the fast local CPU/disk filtering
+    step independent -- a retry here (e.g. after a bugfix) never requires
+    re-downloading gigabytes over the network again."""
+    if dest_csv.exists() and dest_csv.stat().st_size > 0:
+        return True
+    dest_csv.parent.mkdir(parents=True, exist_ok=True)
+    subject_ids = {str(s) for s in subject_ids}
+    fname = raw_gz_path.name
+    tmp = dest_csv.with_suffix(dest_csv.suffix + ".part")
+    total_compressed = raw_gz_path.stat().st_size
+    pb = ProgressBar(total_compressed, progress_label, unit="B", is_bytes=True) if progress_label else None
+
+    kept, total = 0, 0
+    success = False
+    try:
+        with open(raw_gz_path, "rb") as raw:
+            counting = CountingReader(raw)
+            with gzip.GzipFile(fileobj=counting) as gz:
+                text = io.TextIOWrapper(gz, encoding="utf-8", newline="")
+                reader = csv.reader(text)
+                header = next(reader)
+                try:
+                    col_idx = header.index(subject_col)
+                except ValueError:
+                    raise RuntimeError(f"Column '{subject_col}' not found in {fname} header {header}")
+                with open(tmp, "w", newline="", encoding="utf-8") as out:
+                    writer = csv.writer(out)
+                    writer.writerow(header)
+                    for row in reader:
+                        total += 1
+                        if len(row) > col_idx and row[col_idx] in subject_ids:
+                            writer.writerow(row)
+                            kept += 1
+                        if pb:
+                            pb.update(counting.bytes_read, extra=f"kept {kept:,} of {total:,} rows scanned")
+                        elif not quiet and total % 2_000_000 == 0:
+                            print(f"    ...scanned {total:,} rows of {fname}, kept {kept:,} so far")
+        if pb:
+            pb.update(counting.bytes_read, extra=f"kept {kept:,} of {total:,} rows scanned")
+            pb.close()
+        tmp.rename(dest_csv)
+        success = True
+        if not quiet and not progress_label:
+            print(f"  filtered {dest_csv.name}: kept {kept:,} / {total:,} rows")
+        return True
+    except Exception as e:
+        if pb:
+            pb.close()
+        if not quiet:
+            print(f"  FAILED filtering {raw_gz_path}: {e}", file=sys.stderr)
+        return False
+    finally:
+        if not success and tmp.exists():
+            tmp.unlink()
 
 
 # --------------------------------------------------------------------------
@@ -453,6 +895,13 @@ def main():
     ap.add_argument("--cxr-jpg-version", default="2.1.0")
     ap.add_argument("--mimic-iv-version", default="3.1")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument(
+        "--workers", type=int, default=8,
+        help="Parallel download threads for Step 4 (chest X-ray JPEGs). Default 8. "
+             "Set to 1 to fall back to the old one-at-a-time behavior. Lower this if "
+             "you see many FAILED lines (PhysioNet throttling too many concurrent "
+             "connections); raise it if downloads are network-idle between requests.",
+    )
     ap.add_argument("--skip-images", action="store_true", help="Only fetch metadata + hosp tables")
     ap.add_argument("--skip-hosp", action="store_true", help="Only fetch CXR metadata + images")
     ap.add_argument(
@@ -525,7 +974,7 @@ def main():
         "mimic-cxr-2.0.0-split.csv.gz": cxr_local / "mimic-cxr-2.0.0-split.csv",
     }
     for fname, dest in meta_files.items():
-        ok = download_and_gunzip(auth, f"{cxr_base}/{fname}", dest)
+        ok = download_and_gunzip(auth, f"{cxr_base}/{fname}", dest, progress_label=f"  {fname}")
         if not ok:
             print(f"  NOTE: if this 404s, check the exact filename on "
                   f"https://physionet.org/content/mimic-cxr-jpg/{args.cxr_jpg_version}/ "
@@ -571,32 +1020,62 @@ def main():
 
     print("== Step 3/5: radiology reports (extract sampled subjects only) ==")
     reports_zip = out_dir / "mimic-cxr-reports.zip"
-    if download_file(auth, f"{reports_base}/mimic-cxr-reports.zip", reports_zip, min_size=1_000_000):
+    if download_file(auth, f"{reports_base}/mimic-cxr-reports.zip", reports_zip, min_size=1_000_000,
+                      progress_label="  mimic-cxr-reports.zip"):
         reports_out = out_dir / "reports"
         reports_out.mkdir(parents=True, exist_ok=True)
         wanted_tokens = {f"p{sid}" for sid in subjects}
         with zipfile.ZipFile(reports_zip) as zf:
+            names = zf.namelist()
+            extract_pb = ProgressBar(len(names), "  extracting reports", unit="files")
             extracted = 0
-            for name in zf.namelist():
+            for i, name in enumerate(names, 1):
                 parts = name.replace("\\", "/").split("/")
                 stem_tokens = {p.split(".")[0] for p in parts}
                 if wanted_tokens & stem_tokens:
                     zf.extract(name, reports_out)
                     extracted += 1
+                extract_pb.update(i, extra=f"kept {extracted:,}")
+            extract_pb.close()
             print(f"  extracted {extracted} report files for the sampled cohort")
 
     if not args.skip_images:
-        print("== Step 4/5: chest X-ray JPEGs (representative view only) ==")
-        ok_n, fail_n = 0, 0
-        for i, (sid, study_id, dicom_id) in enumerate(manifest_rows, 1):
+        print(f"== Step 4/5: chest X-ray JPEGs (representative view only, "
+              f"{args.workers} parallel workers) ==")
+
+        def _fetch_one(row):
+            sid, study_id, dicom_id = row
             rel = f"{cxr_relative_dir(sid)}/s{study_id}/{dicom_id}.jpg"
             dest = cxr_local / rel
-            if download_file(auth, f"{cxr_base}/{rel}", dest, min_size=1000, quiet=True):
-                ok_n += 1
-            else:
-                fail_n += 1
-            if i % 200 == 0:
-                print(f"  ...{i}/{len(manifest_rows)} ({ok_n} ok, {fail_n} failed so far)")
+            return download_file(auth, f"{cxr_base}/{rel}", dest, min_size=1000, quiet=True)
+
+        ok_n, fail_n, done_n = 0, 0, 0
+        total = len(manifest_rows)
+        img_pb = ProgressBar(total, "  images", unit="img")
+        if args.workers <= 1:
+            # Old sequential path, kept for --workers 1 / troubleshooting.
+            for row in manifest_rows:
+                done_n += 1
+                if _fetch_one(row):
+                    ok_n += 1
+                else:
+                    fail_n += 1
+                img_pb.update(done_n, extra=f"ok={ok_n} fail={fail_n}")
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
+                futures = [pool.submit(_fetch_one, row) for row in manifest_rows]
+                # as_completed yields as each thread finishes, in whatever order that
+                # happens -- done_n/ok_n/fail_n/img_pb are only ever touched here in
+                # the main thread, so no lock is needed even though the downloads
+                # themselves run concurrently in the pool's worker threads.
+                for fut in concurrent.futures.as_completed(futures):
+                    done_n += 1
+                    if fut.result():
+                        ok_n += 1
+                    else:
+                        fail_n += 1
+                    img_pb.update(done_n, extra=f"ok={ok_n} fail={fail_n}")
+        img_pb.close()
         print(f"  done: {ok_n} images downloaded, {fail_n} failed")
     else:
         print("== Step 4/5: skipped (--skip-images) ==")
@@ -604,16 +1083,34 @@ def main():
     if not args.skip_hosp:
         print("== Step 5/5: MIMIC-IV hosp tables (streamed + filtered to sampled subjects) ==")
         for fname in ["d_icd_diagnoses.csv.gz", "d_icd_procedures.csv.gz", "d_hcpcs.csv.gz", "d_labitems.csv.gz"]:
-            download_and_gunzip(auth, f"{hosp_base}/{fname}", hosp_local / fname.replace(".gz", ""))
+            download_and_gunzip(auth, f"{hosp_base}/{fname}", hosp_local / fname.replace(".gz", ""),
+                                 progress_label=f"  {fname}")
 
         wanted_tables = [t.strip() for t in args.hosp_tables.split(",") if t.strip()]
         for table in wanted_tables:
             fname = f"{table}.csv.gz"
-            print(f"  streaming {fname} (this can take a while for labevents)...")
-            stream_filter_gz_csv(
-                auth, f"{hosp_base}/{fname}", hosp_local / f"{table}.csv",
-                subject_col="subject_id", subject_ids=subjects,
-            )
+            dest_csv = hosp_local / f"{table}.csv"
+            if dest_csv.exists() and dest_csv.stat().st_size > 0:
+                continue
+            # Two-phase download for these tables (labevents in particular can be
+            # multi-GB compressed and, on a slow/throttled connection, take many
+            # hours): first fetch the raw .csv.gz with download_range_resumable
+            # (byte-level resumable, and downloaded in --workers parallel chunks
+            # when the server allows it -- so an interrupted run picks back up
+            # instead of restarting from zero), then filter it locally with
+            # filter_local_gz_csv (fast, off-network, safely re-runnable). Falls
+            # back to the old single-stream approach if the raw download can't
+            # complete for some reason (e.g. --workers 1).
+            raw_gz = hosp_local / f"{fname}.raw"
+            if download_range_resumable(auth, f"{hosp_base}/{fname}", raw_gz,
+                                         workers=args.workers, progress_label=f"  {fname}"):
+                if filter_local_gz_csv(raw_gz, dest_csv, subject_col="subject_id",
+                                        subject_ids=subjects, progress_label=f"  filtering {fname}"):
+                    raw_gz.unlink(missing_ok=True)
+            else:
+                print(f"  {fname}: raw download incomplete -- re-run the script later to "
+                      f"resume it (already-downloaded chunks are kept on disk in "
+                      f"{raw_gz.name}.chunk*.part).", file=sys.stderr)
     else:
         print("== Step 5/5: skipped (--skip-hosp) ==")
 

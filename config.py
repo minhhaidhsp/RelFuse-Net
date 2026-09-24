@@ -106,7 +106,18 @@ class Config:
     # Set to False to use a lightweight proxy (DistilBERT) for debugging/smoke tests only;
     # NEVER report results produced with USE_REAL_LLM=False as the paper's findings.
     USE_REAL_LLM = True
-    LLM_ID = "meta-llama/Meta-Llama-3-8B"
+    # The manuscript (Section 3.2.1 / bib36) specifically names "Medical-Llama3-8B"
+    # (ruslanmv/Medical-Llama3-8B on Hugging Face: a full, ungated, Apache-2.0
+    # checkpoint fine-tuned from meta-llama/Meta-Llama-3-8B on medical Q&A, not
+    # merely the generic base model) as the frozen backbone that RelFuse-Net's own
+    # LoRA layers (model.py::TextEncoder) are trained on top of. LLM_ID previously
+    # pointed at the generic base "meta-llama/Meta-Llama-3-8B" -- that would silently
+    # train/evaluate against a different backbone than the one the paper reports and
+    # cites, so any resulting numbers would not actually correspond to the described
+    # method. Same architecture/hidden size (4096) either way, so no other code
+    # changes are needed -- verified against the Hugging Face model card 2026-09-24
+    # (full merged checkpoint, loadable via AutoModel.from_pretrained, ungated).
+    LLM_ID = "ruslanmv/Medical-Llama3-8B"
     LORA_R = 16
     LORA_ALPHA = 32
     LORA_DROPOUT = 0.1
