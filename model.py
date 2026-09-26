@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoModel
-from peft import get_peft_model, LoraConfig, TaskType
+from transformers import AutoModel, BitsAndBytesConfig
+from peft import get_peft_model, LoraConfig, TaskType, prepare_model_for_kbit_training
 from torch_geometric.nn import SAGEConv
 from config import Config
 
@@ -42,7 +42,28 @@ class TextEncoder(nn.Module):
         super().__init__()
         if Config.USE_REAL_LLM:
             print(f"[Model] Initializing {Config.LLM_ID} with LoRA...")
-            base_model = AutoModel.from_pretrained(Config.LLM_ID, load_in_4bit=True)
+            # `load_in_4bit=True` as a direct kwarg to from_pretrained() was removed
+            # in newer transformers releases -- it now falls straight through to the
+            # underlying model's __init__ instead of being consumed for quantization
+            # setup, causing "unexpected keyword argument 'load_in_4bit'". The
+            # supported way (and what actually still works) is an explicit
+            # BitsAndBytesConfig passed as quantization_config, with device_map so
+            # accelerate places the quantized weights directly on the GPU.
+            quant_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+            )
+            base_model = AutoModel.from_pretrained(
+                Config.LLM_ID,
+                quantization_config=quant_config,
+                device_map="auto" if torch.cuda.is_available() else None,
+            )
+            # Standard QLoRA prep (casts norms to fp32, enables input grads on the
+            # frozen 4-bit base) -- required for stable gradients through a
+            # quantized backbone with only the LoRA adapters trainable.
+            base_model = prepare_model_for_kbit_training(base_model)
             peft_config = LoraConfig(
                 task_type=TaskType.FEATURE_EXTRACTION,
                 r=Config.LORA_R,
