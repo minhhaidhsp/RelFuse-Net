@@ -27,6 +27,7 @@ import argparse
 import os
 import json
 import random
+import time
 
 import numpy as np
 import torch
@@ -36,6 +37,7 @@ from torch_geometric.data import Data
 from torch_geometric.loader import NeighborLoader
 from transformers import AutoTokenizer
 from sklearn.metrics import roc_auc_score, average_precision_score, f1_score
+from tqdm.auto import tqdm
 
 from config import Config
 from model import RelFuseNet
@@ -79,9 +81,12 @@ def pretrain_mltm(model: RelFuseNet, train_ds: MimicCxrIvDataset):
     )
     opt = optim.Adam(model.mltm_enc.parameters(), lr=Config.MLTM_PRETRAIN_LR)
 
-    for epoch in range(Config.MLTM_PRETRAIN_EPOCHS):
+    epoch_bar = tqdm(range(Config.MLTM_PRETRAIN_EPOCHS), desc="[MLTM pretrain]", unit="epoch")
+    for epoch in epoch_bar:
         total = 0.0
-        for idx_batch in loader:
+        batch_bar = tqdm(loader, desc=f"  epoch {epoch + 1}/{Config.MLTM_PRETRAIN_EPOCHS}",
+                          unit="batch", leave=False)
+        for idx_batch in batch_bar:
             batch = collate_indices(train_ds, idx_batch.tolist())
             tab = batch["tabular"].to(Config.DEVICE)
             obs = batch["tabular_observed_mask"].to(Config.DEVICE)
@@ -92,8 +97,11 @@ def pretrain_mltm(model: RelFuseNet, train_ds: MimicCxrIvDataset):
             loss.backward()
             opt.step()
             total += loss.item()
+            batch_bar.set_postfix(loss=f"{loss.item():.4f}")
+        avg_loss = total / len(loader)
+        epoch_bar.set_postfix(loss=f"{avg_loss:.4f}")
         if (epoch + 1) % 5 == 0 or epoch == 0:
-            print(f"  [MLTM pretrain] epoch {epoch + 1}/{Config.MLTM_PRETRAIN_EPOCHS} loss={total / len(loader):.4f}")
+            print(f"  [MLTM pretrain] epoch {epoch + 1}/{Config.MLTM_PRETRAIN_EPOCHS} loss={avg_loss:.4f}")
 
 
 def build_full_graph(edge_index_train: torch.Tensor, n_train: int, extra_edges: torch.Tensor = None, n_extra: int = 0):
@@ -106,7 +114,8 @@ def build_full_graph(edge_index_train: torch.Tensor, n_train: int, extra_edges: 
     return Data(x=x_placeholder, edge_index=edge_index, num_nodes=n_total)
 
 
-def run_epoch_train(model, train_ds, edge_index_train, bce, vclubs, vclub_opts, opt, n_train, scenario):
+def run_epoch_train(model, train_ds, edge_index_train, bce, vclubs, vclub_opts, opt, n_train, scenario,
+                     epoch_idx=None, total_epochs=None):
     model.train()
     graph = build_full_graph(edge_index_train, n_train)
     loader = NeighborLoader(
@@ -119,7 +128,11 @@ def run_epoch_train(model, train_ds, edge_index_train, bce, vclubs, vclub_opts, 
 
     total_loss = 0.0
     n_batches = 0
-    for batch in loader:
+    desc = f"[{scenario}] train"
+    if epoch_idx is not None and total_epochs is not None:
+        desc = f"[{scenario}] epoch {epoch_idx + 1}/{total_epochs} train"
+    batch_bar = tqdm(loader, desc=desc, unit="batch", leave=False)
+    for batch in batch_bar:
         global_ids = batch.n_id.tolist()
         local_edge_index = batch.edge_index.to(Config.DEVICE)
         n_seed = batch.batch_size  # first n_seed rows of n_id are the target nodes
@@ -155,6 +168,7 @@ def run_epoch_train(model, train_ds, edge_index_train, bce, vclubs, vclub_opts, 
 
         total_loss += loss.item()
         n_batches += 1
+        batch_bar.set_postfix(loss=f"{total_loss / n_batches:.4f}")
 
     return total_loss / max(n_batches, 1)
 
@@ -179,7 +193,7 @@ def build_eval_graph(train_ds, eval_ds, edge_index_train, n_train):
 
 
 @torch.no_grad()
-def evaluate(model, train_ds, eval_ds, graph, n_train, scenario):
+def evaluate(model, train_ds, eval_ds, graph, n_train, scenario, split_name="eval"):
     """Inductive evaluation: eval_ds nodes are attached ONLY to training nodes.
     `graph` must come from build_eval_graph(train_ds, eval_ds, edge_index_train,
     n_train) -- build it once per run (see that function's docstring) and pass the
@@ -197,7 +211,8 @@ def evaluate(model, train_ds, eval_ds, graph, n_train, scenario):
     )
 
     all_logits, all_labels = [], []
-    for batch in loader:
+    batch_bar = tqdm(loader, desc=f"[{scenario}] evaluate ({split_name})", unit="batch", leave=False)
+    for batch in batch_bar:
         global_ids = batch.n_id.tolist()
         local_edge_index = batch.edge_index.to(Config.DEVICE)
         n_seed = batch.batch_size
@@ -303,7 +318,7 @@ def _load_resume_state(path, model, opt, scheduler, vclubs, vclub_opts):
     return ckpt["epoch"], ckpt["best_val_auc"]
 
 
-def run_one_seed(seed: int, scenario: str = None):
+def run_one_seed(seed: int, scenario: str = None, overall_pbar=None):
     scenario = Config.SCENARIO if scenario is None else scenario
     set_seed(seed)
     print(f"\n=== Run with seed={seed}, scenario={scenario} ===")
@@ -356,14 +371,20 @@ def run_one_seed(seed: int, scenario: str = None):
         start_epoch = last_epoch + 1
         print(f"[Resume] Continuing from epoch {start_epoch + 1}/{Config.EPOCHS} "
               f"(best_val_auc so far = {best_val_auc:.4f}).")
+        if overall_pbar is not None:
+            overall_pbar.update(start_epoch)  # already-completed epochs from a previous (interrupted) run
 
     for epoch in range(start_epoch, Config.EPOCHS):
-        train_loss = run_epoch_train(model, train_ds, edge_index_train, bce, vclubs, vclub_opts, opt, n_train, scenario)
+        epoch_t0 = time.time()
+        train_loss = run_epoch_train(model, train_ds, edge_index_train, bce, vclubs, vclub_opts, opt, n_train, scenario,
+                                      epoch_idx=epoch, total_epochs=Config.EPOCHS)
         scheduler.step()
 
-        val_metrics = evaluate(model, train_ds, val_ds, val_graph, n_train, scenario)
+        val_metrics = evaluate(model, train_ds, val_ds, val_graph, n_train, scenario, split_name="val")
         val_auc = val_metrics["macro"]["auc"]
-        print(f"[{scenario}] Epoch {epoch + 1}/{Config.EPOCHS} | train_loss={train_loss:.4f} | val_macro_AUC={val_auc:.4f}")
+        epoch_time = time.time() - epoch_t0
+        print(f"[{scenario}] Epoch {epoch + 1}/{Config.EPOCHS} | train_loss={train_loss:.4f} | "
+              f"val_macro_AUC={val_auc:.4f} | epoch_time={epoch_time:.0f}s")
 
         if val_auc > best_val_auc:
             best_val_auc = val_auc
@@ -371,12 +392,16 @@ def run_one_seed(seed: int, scenario: str = None):
 
         _save_resume_state(resume_path, epoch, model, opt, scheduler, vclubs, vclub_opts, best_val_auc)
 
+        if overall_pbar is not None:
+            overall_pbar.update(1)
+            overall_pbar.set_postfix(seed=seed, scenario=scenario, val_auc=f"{val_auc:.4f}")
+
     if os.path.exists(resume_path):
         os.remove(resume_path)  # this seed/scenario finished cleanly; nothing left to resume
 
     model.load_state_dict(torch.load(ckpt_path))
     test_graph = build_eval_graph(train_ds, test_ds, edge_index_train, n_train)
-    test_metrics = evaluate(model, train_ds, test_ds, test_graph, n_train, scenario)
+    test_metrics = evaluate(model, train_ds, test_ds, test_graph, n_train, scenario, split_name="test")
     print(f"[Seed {seed}, scenario {scenario}] TEST macro AUC={test_metrics['macro']['auc']:.4f} "
           f"F1={test_metrics['macro']['f1']:.4f} AUPRC={test_metrics['macro']['auprc']:.4f}")
     return test_metrics
@@ -397,7 +422,10 @@ def main():
     """Default entry point: trains/evaluates a single scenario (Config.SCENARIO,
     default 'B', the full model) over Config.NUM_RUNS seeds -- this is what
     produces the paper's main results table."""
-    all_runs = [run_one_seed(seed, Config.SCENARIO) for seed in range(Config.SEED, Config.SEED + Config.NUM_RUNS)]
+    total_epochs = Config.NUM_RUNS * Config.EPOCHS
+    with tqdm(total=total_epochs, desc=f"Overall training [{Config.SCENARIO}]", unit="epoch") as overall_pbar:
+        all_runs = [run_one_seed(seed, Config.SCENARIO, overall_pbar=overall_pbar)
+                    for seed in range(Config.SEED, Config.SEED + Config.NUM_RUNS)]
     _summarize_and_save(all_runs, f"relfusenet_results_scenario{Config.SCENARIO}.json")
 
 
@@ -406,9 +434,12 @@ def run_ablation():
     prospective/report-free and "B" retrospective/full) over Config.NUM_RUNS seeds
     each, as two separately trained models. This produces the paper's Ablation
     Study numbers for "Prospective (report-free) vs. retrospective evaluation"."""
-    for scenario in Config.SCENARIOS_FOR_ABLATION:
-        all_runs = [run_one_seed(seed, scenario) for seed in range(Config.SEED, Config.SEED + Config.NUM_RUNS)]
-        _summarize_and_save(all_runs, f"relfusenet_results_scenario{scenario}.json")
+    total_epochs = len(Config.SCENARIOS_FOR_ABLATION) * Config.NUM_RUNS * Config.EPOCHS
+    with tqdm(total=total_epochs, desc="Overall training (ablation, both scenarios)", unit="epoch") as overall_pbar:
+        for scenario in Config.SCENARIOS_FOR_ABLATION:
+            all_runs = [run_one_seed(seed, scenario, overall_pbar=overall_pbar)
+                        for seed in range(Config.SEED, Config.SEED + Config.NUM_RUNS)]
+            _summarize_and_save(all_runs, f"relfusenet_results_scenario{scenario}.json")
 
 
 if __name__ == "__main__":
