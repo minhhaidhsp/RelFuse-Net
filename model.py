@@ -124,17 +124,61 @@ class TextEncoder(nn.Module):
 
         self.fc = nn.Linear(self.embed_dim, Config.PROJ_DIM)
 
-    def forward(self, input_ids, attention_mask):
-        outputs = self.llm(input_ids=input_ids, attention_mask=attention_mask)
-        H = outputs.last_hidden_state  # [B, L, d]
+    # Memory: RelFuseNet.forward calls this encoder on the ENTIRE GraphSAGE-
+    # sampled subgraph, not just the batch's seed nodes -- the graph layers
+    # need text features for neighbor nodes too (same rationale as
+    # VisionEncoder above). An 8B-parameter LLM forward (hidden_size=4096, up
+    # to MAX_LEN=512 tokens, many decoder layers) is far more memory-hungry
+    # per sample than DenseNet-121, so a large sampled subgraph can still OOM
+    # here even though prepare_model_for_kbit_training() already enables the
+    # base model's own internal per-layer gradient checkpointing -- that only
+    # bounds CROSS-LAYER activation memory, not the batch-size dimension
+    # (e.g. the O(seq_len^2) attention score matrix scales with how many
+    # sequences are processed at once). Fix: bound how many sequences go
+    # through the LLM in one forward call, the same way VisionEncoder bounds
+    # images -- split into chunks of at most CHUNK_SIZE and concatenate the
+    # pooled outputs.
+    #
+    # Deliberately NOT wrapped in an extra torch.utils.checkpoint.checkpoint()
+    # call like VisionEncoder's chunks are: input_ids/attention_mask are
+    # integer tensors that can never have requires_grad=True, and
+    # torch.utils.checkpoint silently drops autograd tracking through a call
+    # whose inputs are all non-differentiable -- wrapping it that way would
+    # silently break gradients into the LoRA adapters (a correctness bug, far
+    # worse than the OOM it would "fix"). The base model's own internal,
+    # correctly-wired gradient checkpointing already applies per layer, so no
+    # outer checkpoint wrapper is needed -- or safe -- here.
+    CHUNK_SIZE = 8
+
+    def _encode_chunk(self, ids_chunk, mask_chunk):
+        if self.training:
+            outputs = self.llm(input_ids=ids_chunk, attention_mask=mask_chunk)
+        else:
+            with torch.no_grad():
+                outputs = self.llm(input_ids=ids_chunk, attention_mask=mask_chunk)
+        H = outputs.last_hidden_state  # [chunk, L, d]
 
         # Mean pooling over real tokens only (Eq. 2), excluding padding via the
         # attention mask -- averaging padded zeros in would bias short reports.
-        mask = attention_mask.unsqueeze(-1).to(H.dtype)  # [B, L, 1]
+        mask = mask_chunk.unsqueeze(-1).to(H.dtype)  # [chunk, L, 1]
         summed = (H * mask).sum(dim=1)
         count = mask.sum(dim=1).clamp(min=1.0)
-        h_text = summed / count  # [B, d]
+        return summed / count  # [chunk, d]
 
+    def forward(self, input_ids, attention_mask):
+        if input_ids.shape[0] <= self.CHUNK_SIZE:
+            h_text = self._encode_chunk(input_ids, attention_mask)
+        else:
+            h_text = torch.cat(
+                [
+                    self._encode_chunk(ids_chunk, mask_chunk)
+                    for ids_chunk, mask_chunk in zip(
+                        input_ids.split(self.CHUNK_SIZE, dim=0),
+                        attention_mask.split(self.CHUNK_SIZE, dim=0),
+                    )
+                ],
+                dim=0,
+            )
         return self.fc(h_text)
 
 
