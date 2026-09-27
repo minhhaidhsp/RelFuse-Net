@@ -148,7 +148,17 @@ class TextEncoder(nn.Module):
     # worse than the OOM it would "fix"). The base model's own internal,
     # correctly-wired gradient checkpointing already applies per layer, so no
     # outer checkpoint wrapper is needed -- or safe -- here.
-    CHUNK_SIZE = 8
+    #
+    # CHUNK_SIZE=8 was tried on real GPU L4 (23GB) hardware first and still
+    # OOM'd -- "22.00 GiB memory in use" out of 22.03 GiB, missing only 224
+    # MiB for one MLP matmul inside a single Llama decoder layer. Lowered to
+    # 4: the 8B backbone's constant resident footprint (quantized weights +
+    # per-layer checkpointed segment inputs) leaves very little headroom on a
+    # 23GB card once VisionEncoder + the graph layers are also holding memory
+    # in the same forward/backward pass, so even one chunk of 8 sequences
+    # through the LLM was too much. If 4 still isn't enough, try 2 or 1 next
+    # -- there is no smaller unit below a single sequence.
+    CHUNK_SIZE = 4
 
     def _encode_chunk(self, ids_chunk, mask_chunk):
         if self.training:

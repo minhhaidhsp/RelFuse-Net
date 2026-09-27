@@ -23,8 +23,17 @@ RelFuse-Net training pipeline (Algorithm 2), corrected to:
 Run `preprocessing/build_mimic_dataset.py` first to produce the three CSVs and
 the training graph this script expects.
 """
-import argparse
 import os
+
+# Must be set before the first CUDA allocation (i.e. before anything below
+# actually touches the GPU) -- PyTorch's own OOM error message recommended
+# this after a real GPU-L4 crash left 2.53 GiB "reserved but unallocated" by
+# the allocator, more than the ~224 MiB deficit that caused the crash.
+# expandable_segments reduces that fragmentation waste; it is a memory-
+# allocator tuning knob only and changes no training logic or results.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import argparse
 import json
 import random
 import time
