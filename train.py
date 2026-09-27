@@ -440,6 +440,42 @@ def run_one_seed(seed: int, scenario: str = None, overall_pbar=None):
     edge_index_train = torch.load(Config.GRAPH_EDGES_TRAIN)
     n_train = len(train_ds)
 
+    ckpt_path = f"relfusenet_best_seed{seed}_scenario{scenario}.pth"
+    resume_path = _resume_path(seed, scenario)
+
+    # Recovery path: resume_path is only ever removed right after the training
+    # loop below finishes ALL Config.EPOCHS cleanly (see the "finished
+    # cleanly" comment further down). So if ckpt_path (the best-val-AUC
+    # checkpoint) already exists AND resume_path does NOT, a previous run of
+    # this exact seed/scenario already completed every training epoch and
+    # crashed somewhere AFTER that -- e.g. at the checkpoint-reload step,
+    # which is exactly the bitsandbytes state_dict bug fixed above. Retraining
+    # from epoch 0 in that case would throw away already-completed GPU time
+    # (both the MLTM pretraining stage and the full main training loop) for
+    # no reason: the fully-trained weights are still sitting safely in
+    # ckpt_path. So: skip MLTM pretraining and the training loop entirely and
+    # go straight to reloading that checkpoint + test evaluation. If the
+    # checkpoint turns out to be incompatible with the current model
+    # architecture (e.g. a stale file from a much older, since-changed
+    # version of model.py), _load_trainable_state_dict still fails loudly
+    # rather than silently accepting a partially-wrong checkpoint.
+    if os.path.exists(ckpt_path) and not os.path.exists(resume_path):
+        print(f"[Recover] Found completed checkpoint {ckpt_path} with no pending "
+              f"resume state -- a previous run of seed={seed} scenario={scenario} "
+              f"already finished all {Config.EPOCHS} training epochs. Skipping "
+              f"MLTM pretraining and the training loop, evaluating this "
+              f"checkpoint on the test set directly instead of retraining "
+              f"from scratch.")
+        model = RelFuseNet().to(Config.DEVICE)
+        _load_trainable_state_dict(model, torch.load(ckpt_path, map_location=Config.DEVICE), ckpt_path)
+        test_graph = build_eval_graph(train_ds, test_ds, edge_index_train, n_train)
+        test_metrics = evaluate(model, train_ds, test_ds, test_graph, n_train, scenario, split_name="test")
+        print(f"[Seed {seed}, scenario {scenario}] TEST macro AUC={test_metrics['macro']['auc']:.4f} "
+              f"F1={test_metrics['macro']['f1']:.4f} AUPRC={test_metrics['macro']['auprc']:.4f}")
+        if overall_pbar is not None:
+            overall_pbar.update(Config.EPOCHS)  # count as done for the overall ETA bar
+        return test_metrics
+
     # Built once (see build_eval_graph's docstring): eval_ds's ICD/CPT histories
     # never change during this run, so the inductive-attachment graph they produce
     # doesn't either -- reused across every epoch's validation pass below instead
@@ -462,8 +498,6 @@ def run_one_seed(seed: int, scenario: str = None, overall_pbar=None):
     opt = optim.AdamW(main_params, lr=Config.LR, weight_decay=Config.WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=Config.EPOCHS, eta_min=Config.LR_MIN)
 
-    ckpt_path = f"relfusenet_best_seed{seed}_scenario{scenario}.pth"
-    resume_path = _resume_path(seed, scenario)
     start_epoch = 0
     best_val_auc = 0.0
     if os.path.exists(resume_path):
