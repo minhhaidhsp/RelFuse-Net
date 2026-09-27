@@ -284,6 +284,94 @@ def evaluate(model, train_ds, eval_ds, graph, n_train, scenario, split_name="eva
     return {"per_class": per_class, "macro": macro}
 
 
+# ---------------------------------------------------------------------------
+# Checkpointing a model whose TextEncoder wraps a bitsandbytes 4-bit-quantized
+# (NF4) frozen LLM backbone + LoRA adapters (see model.py::TextEncoder) needs
+# special care. bitsandbytes' Linear4bit layers add non-standard quantization
+# bookkeeping entries to the PLAIN `model.state_dict()` output for every
+# quantized weight -- keys such as
+#   text_enc.llm.base_model.model.layers.{i}.{...}_proj.base_layer.weight.absmax
+#   ....weight.quant_map / ....weight.nested_absmax / ....weight.nested_quant_map
+#   ....weight.quant_state.bitsandbytes__nf4
+# for the FROZEN backbone. These entries are reproduced identically every time
+# TextEncoder.__init__ quantizes Config.LLM_ID and never change during
+# training (no optimizer step ever touches a frozen 4-bit weight), but a known
+# bitsandbytes/PyTorch incompatibility means a state dict containing them
+# cannot always be fed back into `model.load_state_dict()` -- even into the
+# exact same live model object that produced them a moment earlier -- without
+# raising "Error(s) in loading state_dict ... Unexpected key(s) in
+# state_dict: ...". This is exactly the crash seen reloading
+# relfusenet_best_seed{seed}_scenario{scenario}.pth at the end of a full,
+# otherwise-clean training run.
+#
+# Fix: never save or reload those frozen-backbone entries at all. Standard
+# QLoRA practice is to checkpoint only the trainable parameters (LoRA adapter
+# weights, plus every other non-frozen module here: vision/graph/tabular
+# encoders, projection heads, classifier) and ordinary buffers that matter for
+# correctness (e.g. DenseNet BatchNorm running_mean/running_var), then reload
+# with strict=False. The frozen quantized backbone doesn't need restoring --
+# it's the same tensors already sitting in `model` (this script never
+# re-instantiates RelFuseNet between save and load), so skipping it is not a
+# loss of information, and it also makes every checkpoint file dramatically
+# smaller (megabytes of LoRA + head weights instead of the full ~8B-parameter
+# quantized backbone).
+BNB_QUANT_STATE_MARKERS = (
+    ".absmax",
+    ".quant_map",
+    ".nested_absmax",
+    ".nested_quant_map",
+    ".quant_state.bitsandbytes__nf4",
+)
+FROZEN_LLM_BACKBONE_PREFIX = "text_enc.llm.base_model.model"
+
+
+def _trainable_state_dict(model):
+    """model.state_dict() filtered down to: (a) parameters with
+    requires_grad=True (LoRA adapters + every non-LLM module, since PEFT's
+    get_peft_model() freezes the whole base backbone and leaves only the
+    adapter trainable), plus (b) ordinary buffers outside the frozen LLM
+    backbone (e.g. BatchNorm stats). Frozen backbone weights and their
+    bitsandbytes quant-state bookkeeping are deliberately excluded -- see the
+    module-level comment above."""
+    trainable_param_names = {n for n, p in model.named_parameters() if p.requires_grad}
+    buffer_names = {n for n, _ in model.named_buffers()}
+    full = model.state_dict()
+    filtered = {}
+    for k, v in full.items():
+        if any(marker in k for marker in BNB_QUANT_STATE_MARKERS):
+            continue  # bitsandbytes quant-state bookkeeping for the frozen backbone
+        if k in trainable_param_names:
+            filtered[k] = v
+        elif k in buffer_names and not k.startswith(FROZEN_LLM_BACKBONE_PREFIX):
+            filtered[k] = v
+        # else: frozen backbone weight (e.g. ...base_layer.weight itself) --
+        # deterministically reproduced by TextEncoder.__init__ and never
+        # mutated, so it's safe and necessary to skip.
+    return filtered
+
+
+def _load_trainable_state_dict(model, state, ckpt_label):
+    """Counterpart to `_trainable_state_dict`: loads a filtered checkpoint
+    with strict=False (it is EXPECTED to be missing the frozen LLM backbone
+    keys we chose not to save), but still fails loudly if anything else is
+    off -- a genuinely trainable parameter missing, or an unexpected key that
+    isn't just frozen-backbone quant-state -- since that would indicate a real
+    checkpoint/model mismatch rather than the known bitsandbytes quirk."""
+    result = model.load_state_dict(state, strict=False)
+    bad_missing = [k for k in result.missing_keys if not k.startswith(FROZEN_LLM_BACKBONE_PREFIX)]
+    bad_unexpected = [
+        k for k in result.unexpected_keys
+        if not any(marker in k for marker in BNB_QUANT_STATE_MARKERS)
+    ]
+    if bad_missing or bad_unexpected:
+        raise RuntimeError(
+            f"Loading '{ckpt_label}' left the model in an unexpected state -- "
+            f"this is NOT the known/handled bitsandbytes frozen-backbone gap. "
+            f"Unexplained missing keys: {bad_missing}. "
+            f"Unexplained unexpected keys: {bad_unexpected}."
+        )
+
+
 def _resume_path(seed: int, scenario: str) -> str:
     return f"relfusenet_resume_seed{seed}_scenario{scenario}.pt"
 
@@ -295,7 +383,7 @@ def _save_resume_state(path, epoch, model, opt, scheduler, vclubs, vclub_opts, b
     (Colab disconnect, remote SSH drop, etc.) loses at most one epoch of work."""
     state = {
         "epoch": epoch,
-        "model": model.state_dict(),
+        "model": _trainable_state_dict(model),
         "opt": opt.state_dict(),
         "scheduler": scheduler.state_dict(),
         "vclubs": {k: v.state_dict() for k, v in vclubs.items()},
@@ -315,7 +403,7 @@ def _save_resume_state(path, epoch, model, opt, scheduler, vclubs, vclub_opts, b
 
 def _load_resume_state(path, model, opt, scheduler, vclubs, vclub_opts):
     ckpt = torch.load(path, map_location=Config.DEVICE)
-    model.load_state_dict(ckpt["model"])
+    _load_trainable_state_dict(model, ckpt["model"], path)
     opt.load_state_dict(ckpt["opt"])
     scheduler.load_state_dict(ckpt["scheduler"])
     for k, v in vclubs.items():
@@ -401,7 +489,7 @@ def run_one_seed(seed: int, scenario: str = None, overall_pbar=None):
 
         if val_auc > best_val_auc:
             best_val_auc = val_auc
-            torch.save(model.state_dict(), ckpt_path)
+            torch.save(_trainable_state_dict(model), ckpt_path)
 
         _save_resume_state(resume_path, epoch, model, opt, scheduler, vclubs, vclub_opts, best_val_auc)
 
@@ -412,7 +500,7 @@ def run_one_seed(seed: int, scenario: str = None, overall_pbar=None):
     if os.path.exists(resume_path):
         os.remove(resume_path)  # this seed/scenario finished cleanly; nothing left to resume
 
-    model.load_state_dict(torch.load(ckpt_path))
+    _load_trainable_state_dict(model, torch.load(ckpt_path), ckpt_path)
     test_graph = build_eval_graph(train_ds, test_ds, edge_index_train, n_train)
     test_metrics = evaluate(model, train_ds, test_ds, test_graph, n_train, scenario, split_name="test")
     print(f"[Seed {seed}, scenario {scenario}] TEST macro AUC={test_metrics['macro']['auc']:.4f} "
