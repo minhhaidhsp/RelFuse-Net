@@ -91,6 +91,19 @@ def pretrain_mltm(model: RelFuseNet, train_ds: MimicCxrIvDataset):
             tab = batch["tabular"].to(Config.DEVICE)
             obs = batch["tabular_observed_mask"].to(Config.DEVICE)
 
+            if torch.isnan(tab).any():
+                raise RuntimeError(
+                    "NaN detected in tabular features going into MLTM "
+                    "pretraining. This almost always means data/processed/*.csv "
+                    "was generated before the build_tabular_features NaN-guard "
+                    "fix (a MIMIC-IV lab order can exist with a null valuenum, "
+                    "which used to still be marked 'observed' and poisoned "
+                    "zscore_fit_apply's mean/std for that whole column). "
+                    "Re-run preprocessing/build_mimic_dataset.py to regenerate "
+                    "clean CSVs -- do not just re-run this script, the bad "
+                    "values are baked into the CSVs on disk."
+                )
+
             opt.zero_grad()
             _, x_hat, a = model.mltm_enc(tab, obs, training=True)
             loss = mltm_reconstruction_loss(tab, x_hat, a)

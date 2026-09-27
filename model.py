@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from transformers import AutoModel, BitsAndBytesConfig
 from peft import get_peft_model, LoraConfig, TaskType, prepare_model_for_kbit_training
 from torch_geometric.nn import SAGEConv
@@ -9,6 +10,32 @@ from config import Config
 
 # --- 1. Vision Encoder (DenseNet-121) ---
 class VisionEncoder(nn.Module):
+    """DenseNet-121 backbone -> Config.PROJ_DIM projection.
+
+    Memory note: this is called on EVERY node RelFuseNet.forward() is given,
+    not just the Config.BATCH_SIZE=32 seed admissions -- GraphSAGE needs the
+    sampled neighbors' image features too. With GRAPH_LAYERS=2 hops of 10
+    neighbors each (train.py's NeighborLoader), one mini-batch's sampled
+    subgraph can be an order of magnitude larger than 32 nodes, and running
+    DenseNet121 -- whose dense blocks keep concatenating an ever-growing
+    feature map across depth (`torch.cat` inside torchvision's
+    `bn_function`) -- over all of it in a single forward call is what
+    exhausted GPU memory (crash traceback pointed exactly at that `torch.cat`).
+
+    Both mitigations below are pure memory/compute tradeoffs: neither changes
+    BATCH_SIZE, GRAPH_LAYERS, num_neighbors, or the forward/backward math --
+    same result (up to negligible floating-point reassociation), more compute
+    time, bounded peak memory:
+      - gradient checkpointing (training only): don't retain every dense
+        block's intermediate concatenated feature map for backward: discard
+        after the forward pass and recompute from the chunk's input during
+        backward instead.
+      - chunking: never run more than CHUNK_SIZE images through the backbone
+        in one call, regardless of how large the sampled subgraph is.
+    """
+
+    CHUNK_SIZE = 64
+
     def __init__(self):
         super().__init__()
         from torchvision.models import densenet121
@@ -17,8 +44,25 @@ class VisionEncoder(nn.Module):
         self.backbone.classifier = nn.Identity()
         self.fc = nn.Linear(num_ftrs, Config.PROJ_DIM)
 
+    def _encode_chunk(self, x_chunk):
+        if self.training:
+            if x_chunk.is_floating_point() and not x_chunk.requires_grad:
+                # checkpoint needs an input that requires grad to attach the
+                # backward graph even though only the backbone's parameters
+                # (not the raw pixels) actually need gradients here.
+                x_chunk = x_chunk.clone().requires_grad_(True)
+            return checkpoint(self.backbone, x_chunk, use_reentrant=False)
+        with torch.no_grad():
+            return self.backbone(x_chunk)
+
     def forward(self, x):
-        features = self.backbone(x)
+        if x.shape[0] <= self.CHUNK_SIZE:
+            features = self._encode_chunk(x)
+        else:
+            features = torch.cat(
+                [self._encode_chunk(chunk) for chunk in x.split(self.CHUNK_SIZE, dim=0)],
+                dim=0,
+            )
         return self.fc(features)
 
 

@@ -43,20 +43,26 @@ CHEXPERT_LABELS = [
     "Pneumothorax", "Pleural Effusion", "Pleural Other", "Fracture", "Support Devices",
 ]
 
-# TODO (before running on REAL data): replace with your own curated MIMIC-IV
-# d_labitems itemid list (labs + vitals), in the exact order that should
-# populate the TABULAR_DIM=50 feature vector -- this is a research design
-# choice (which labs/vitals matter clinically), not something that can be
-# auto-derived.
-#
-# The values below are PLACEHOLDERS that only exist in the synthetic seed
-# data from preprocessing/generate_physionet_seed.py (SEED_LAB_ITEM_IDS in
-# that script) -- they are intentionally far outside MIMIC-IV's real itemid
-# range (which is 5-6 digits, e.g. 50912) so they can never be silently
-# mistaken for real lab items. Swap this list out before running against a
-# real MIMIC-IV download.
-LAB_ITEM_IDS = [90001, 90002, 90003, 90004, 90005, 90006, 90007, 90008]
-# e.g. for real data: [50912, 50971, 51006, ...]  (Creatinine, Potassium, BUN, ...)
+# Chosen 2026-09-24 from the REAL downloaded cohort (2000 subjects, 1175
+# candidate admissions with a representative CXR study) via
+# preprocessing/select_lab_items.py: the top TABULAR_DIM=50 MIMIC-IV
+# labevents itemids by coverage_frac (fraction of candidate admissions with
+# >=1 non-null valuenum reading in the 48h-before-t0 window), computed with
+# this script's own load_cxr_metadata/load_admissions/map_study_to_admission/
+# select_representative_view functions so the population matches exactly.
+# Ranked 68.1% (Urea Nitrogen/Creatinine) down to 10.8% (Epithelial Cells,
+# Urine) coverage; full ranked table (279 itemids) at lab_item_candidates.csv.
+# All 5 of the manuscript's illustrative Table 1 panel (Albumin, Creatinine,
+# BUN, AST, Bilirubin) are included. This is a research design choice
+# (reviewed and confirmed with the paper's author before use) -- rerun
+# select_lab_items.py and update this list if the cohort changes.
+LAB_ITEM_IDS = [
+    51006, 50912, 50902, 50971, 50983, 50882, 50868, 50931, 51221, 51265,
+    51222, 51277, 51279, 51248, 51249, 51250, 51301, 50960, 50893, 50970,
+    51237, 51274, 51275, 50878, 50861, 50885, 50863, 50813, 51146, 51200,
+    51254, 51256, 51244, 52172, 50820, 50804, 50821, 50802, 50818, 50862,
+    51491, 51498, 50954, 50911, 50910, 50808, 51493, 51516, 50822, 51476,
+]
 
 
 def _read_gz_csv(path, **kwargs):
@@ -184,8 +190,20 @@ def build_tabular_features(labevents: pd.DataFrame, hadm_id, t0, window_hours: i
     for i, itemid in enumerate(LAB_ITEM_IDS[: Config.TABULAR_DIM]):
         match = latest[latest["itemid"] == itemid]
         if len(match) > 0:
-            values[i] = float(match["valuenum"].iloc[0])
-            observed[i] = 1.0
+            val = match["valuenum"].iloc[0]
+            if pd.notna(val):
+                values[i] = float(val)
+                observed[i] = 1.0
+            # else: a lab order exists for this itemid in the window, but
+            # MIMIC-IV's own valuenum is null for it (a known data-quality
+            # quirk -- e.g. a qualitative/text-only result with no numeric
+            # value recorded). Treat this exactly like "not recorded" --
+            # values[i] stays 0.0, observed[i] stays 0. Previously this
+            # branch still set observed[i]=1.0 with values[i]=NaN, which
+            # poisoned zscore_fit_apply's column mean/std with NaN --
+            # corrupting that ENTIRE column (every admission, every split)
+            # with NaN, which is what produced loss=nan for 100% of the
+            # MLTM-pretrain batches.
     return values, observed
 
 
@@ -196,6 +214,15 @@ def zscore_fit_apply(train_values, train_mask, *other_splits_values_masks):
     means, stds = [], []
     for d in range(train_values.shape[1]):
         col = train_values[train_mask[:, d] == 1, d]
+        if len(col) and np.isnan(col).any():
+            raise ValueError(
+                f"Column {d}: tabular_observed_mask marks some entries as "
+                f"recorded, but their raw value is NaN. This should be "
+                f"impossible after build_tabular_features's NaN guard -- "
+                f"investigate the raw MIMIC-IV labevents for this lab item "
+                f"before proceeding. A single NaN here poisons this column's "
+                f"mean/std for every admission in every split."
+            )
         means.append(col.mean() if len(col) else 0.0)
         stds.append(col.std() if len(col) > 1 else 1.0)
     means, stds = np.array(means), np.array(stds)
