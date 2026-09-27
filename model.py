@@ -139,33 +139,15 @@ class TextEncoder(nn.Module):
     # images -- split into chunks of at most CHUNK_SIZE and concatenate the
     # pooled outputs.
     #
-    # Deliberately NOT wrapped in an extra torch.utils.checkpoint.checkpoint()
-    # call like VisionEncoder's chunks are: input_ids/attention_mask are
-    # integer tensors that can never have requires_grad=True, and
-    # torch.utils.checkpoint silently drops autograd tracking through a call
-    # whose inputs are all non-differentiable -- wrapping it that way would
-    # silently break gradients into the LoRA adapters (a correctness bug, far
-    # worse than the OOM it would "fix"). The base model's own internal,
-    # correctly-wired gradient checkpointing already applies per layer, so no
-    # outer checkpoint wrapper is needed -- or safe -- here.
-    #
-    # CHUNK_SIZE=8 was tried on real GPU L4 (23GB) hardware first and still
-    # OOM'd -- "22.00 GiB memory in use" out of 22.03 GiB, missing only 224
-    # MiB for one MLP matmul inside a single Llama decoder layer. Lowered to
-    # 4: the 8B backbone's constant resident footprint (quantized weights +
-    # per-layer checkpointed segment inputs) leaves very little headroom on a
-    # 23GB card once VisionEncoder + the graph layers are also holding memory
-    # in the same forward/backward pass, so even one chunk of 8 sequences
-    # through the LLM was too much. If 4 still isn't enough, try 2 or 1 next
-    # -- there is no smaller unit below a single sequence.
+    # CHUNK_SIZE history on real GPU L4 (23GB) hardware: 8 OOM'd missing 224
+    # MiB; 4 STILL OOM'd (missing 112 MiB, GPU at 99.9%+ utilization) despite
+    # being half the size -- which is the tell that chunking alone wasn't
+    # bounding memory the way it was supposed to (see below). Left at 4 since
+    # the real fix is the checkpoint wrapper just added, not a smaller number.
     CHUNK_SIZE = 4
 
     def _encode_chunk(self, ids_chunk, mask_chunk):
-        if self.training:
-            outputs = self.llm(input_ids=ids_chunk, attention_mask=mask_chunk)
-        else:
-            with torch.no_grad():
-                outputs = self.llm(input_ids=ids_chunk, attention_mask=mask_chunk)
+        outputs = self.llm(input_ids=ids_chunk, attention_mask=mask_chunk)
         H = outputs.last_hidden_state  # [chunk, L, d]
 
         # Mean pooling over real tokens only (Eq. 2), excluding padding via the
@@ -175,13 +157,56 @@ class TextEncoder(nn.Module):
         count = mask.sum(dim=1).clamp(min=1.0)
         return summed / count  # [chunk, d]
 
+    def _run_chunk(self, ids_chunk, mask_chunk):
+        if not self.training:
+            with torch.no_grad():
+                return self._encode_chunk(ids_chunk, mask_chunk)
+        # Wrapped in torch.utils.checkpoint.checkpoint(..., use_reentrant=False),
+        # same as VisionEncoder's chunks. An EARLIER version of this code
+        # deliberately did NOT do this, reasoning that torch.utils.checkpoint
+        # "silently drops autograd tracking" whenever none of the wrapped call's
+        # own inputs (input_ids/attention_mask -- integer tensors, never
+        # differentiable) require grad, and that this would silently break
+        # gradients into the LoRA adapters.
+        #
+        # That reasoning was WRONG for use_reentrant=False specifically (right
+        # for the legacy use_reentrant=True path, which is why VisionEncoder's
+        # own chunk wrapper takes care to give it a floating input that does
+        # require grad -- but even there it turns out not to be load-bearing;
+        # see below). Verified empirically before making this change, with a
+        # minimal reproduction of this exact shape (frozen embedding + int
+        # inputs + a trainable adapter downstream, matching frozen-backbone +
+        # LoRA here): use_reentrant=True raises a loud RuntimeError in this
+        # situation (safe, if unhelpful); use_reentrant=False builds the
+        # forward graph normally and correctly backpropagates into the
+        # trainable adapter regardless of whether the checkpoint's own
+        # positional arguments require grad, because gradient flow depends on
+        # the model's internal parameters (the LoRA adapters) requiring grad,
+        # not on the wrapped call's arguments.
+        #
+        # This is also the actual fix for the CHUNK_SIZE=4-still-OOM'd
+        # regression: without this wrapper, PyTorch's autograd keeps every
+        # chunk's activations (specifically the per-layer boundary tensors
+        # saved by the LLM's own internal gradient checkpointing) alive until
+        # the WHOLE RelFuseNet.forward()'s eventual .backward() call -- calling
+        # _encode_chunk() in a loop only builds each chunk's forward graph, it
+        # does not free anything, so peak memory scaled with the TOTAL number
+        # of text sequences in the sampled subgraph, not with CHUNK_SIZE --
+        # exactly why halving CHUNK_SIZE from 8 to 4 barely moved the needle.
+        # Wrapping each chunk in its own checkpoint() call discards that
+        # chunk's activations immediately after its forward call returns and
+        # recomputes them only when that chunk's own backward runs, so peak
+        # memory here is now bounded by ONE chunk at a time, as intended from
+        # the start.
+        return checkpoint(self._encode_chunk, ids_chunk, mask_chunk, use_reentrant=False)
+
     def forward(self, input_ids, attention_mask):
         if input_ids.shape[0] <= self.CHUNK_SIZE:
-            h_text = self._encode_chunk(input_ids, attention_mask)
+            h_text = self._run_chunk(input_ids, attention_mask)
         else:
             h_text = torch.cat(
                 [
-                    self._encode_chunk(ids_chunk, mask_chunk)
+                    self._run_chunk(ids_chunk, mask_chunk)
                     for ids_chunk, mask_chunk in zip(
                         input_ids.split(self.CHUNK_SIZE, dim=0),
                         attention_mask.split(self.CHUNK_SIZE, dim=0),
