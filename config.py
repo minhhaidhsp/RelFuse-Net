@@ -98,6 +98,25 @@ class Config:
     BATCH_SIZE = 32
     EPOCHS = 50
     LR = 2e-4
+
+    # --- Scenario-specific NeighborLoader sizing (memory/runtime, NOT model
+    # architecture -- GraphSAGE is still exactly K=GRAPH_LAYERS=2 hops
+    # regardless of how many neighbors are SAMPLED per hop during minibatch
+    # training/eval; this only controls the *variance* of that sampling
+    # approximation, same as any GraphSAGE minibatch implementation).
+    #
+    # Scenario B additionally runs every sampled node (seeds + neighbors)
+    # through the 8B-param LLM text encoder, so its per-batch subgraph size
+    # is what was driving repeated CUDA OOMs even with gradient checkpointing
+    # + chunking already in VisionEncoder/TextEncoder (see model.py): with
+    # the default BATCH_SIZE=32 seeds and 10 neighbors/hop over 2 hops, a
+    # single minibatch's *unique* sampled subgraph can be several hundred
+    # nodes, each needing a DenseNet-121 AND a Medical-Llama3-8B forward+
+    # backward pass. Scenario A never calls the text encoder at all (see
+    # RelFuseNet.forward's scenario branch), so it is unaffected by this and
+    # keeps the same fanout/batch size it already trained and reported with.
+    NEIGHBOR_FANOUT_BY_SCENARIO = {"A": 10, "B": 4}
+    BATCH_SIZE_BY_SCENARIO = {"A": BATCH_SIZE, "B": 8}
     WEIGHT_DECAY = 1e-2
     LR_MIN = 1e-6            # cosine-annealing floor
 

@@ -24,6 +24,7 @@ Run `preprocessing/build_mimic_dataset.py` first to produce the three CSVs and
 the training graph this script expects.
 """
 import os
+import gc
 
 # Must be set before the first CUDA allocation (i.e. before anything below
 # actually touches the GPU) -- PyTorch's own OOM error message recommended
@@ -140,10 +141,12 @@ def run_epoch_train(model, train_ds, edge_index_train, bce, vclubs, vclub_opts, 
                      epoch_idx=None, total_epochs=None):
     model.train()
     graph = build_full_graph(edge_index_train, n_train)
+    fanout = Config.NEIGHBOR_FANOUT_BY_SCENARIO.get(scenario, 10)
+    batch_size = Config.BATCH_SIZE_BY_SCENARIO.get(scenario, Config.BATCH_SIZE)
     loader = NeighborLoader(
         graph,
-        num_neighbors=[10] * Config.GRAPH_LAYERS,
-        batch_size=Config.BATCH_SIZE,
+        num_neighbors=[fanout] * Config.GRAPH_LAYERS,
+        batch_size=batch_size,
         input_nodes=torch.arange(n_train),
         shuffle=True,
     )
@@ -192,6 +195,18 @@ def run_epoch_train(model, train_ds, edge_index_train, bce, vclubs, vclub_opts, 
         n_batches += 1
         batch_bar.set_postfix(loss=f"{total_loss / n_batches:.4f}")
 
+        # Insurance against allocator fragmentation across batches (cheap;
+        # does not change any math) -- Scenario B's sampled subgraphs vary in
+        # size batch to batch and earlier runs OOM'd right at the GPU's
+        # capacity ceiling (99.9%+ utilization), where a few hundred MB of
+        # unreclaimed fragmented memory is the difference between fitting
+        # and crashing.
+        del out, logits_seed, z_s, z_img, z_txt, z_tab, loss, loss_cls, loss_disentangle
+        del raw, img, txt, mask, tab, tab_obs, lbl, local_edge_index
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
     return total_loss / max(n_batches, 1)
 
 
@@ -224,10 +239,12 @@ def evaluate(model, train_ds, eval_ds, graph, n_train, scenario, split_name="eva
     model.eval()
     n_eval = len(eval_ds)
 
+    fanout = Config.NEIGHBOR_FANOUT_BY_SCENARIO.get(scenario, 10)
+    batch_size = Config.BATCH_SIZE_BY_SCENARIO.get(scenario, Config.BATCH_SIZE)
     loader = NeighborLoader(
         graph,
-        num_neighbors=[10] * Config.GRAPH_LAYERS,
-        batch_size=Config.BATCH_SIZE,
+        num_neighbors=[fanout] * Config.GRAPH_LAYERS,
+        batch_size=batch_size,
         input_nodes=torch.arange(n_train, n_train + n_eval),
         shuffle=False,
     )
